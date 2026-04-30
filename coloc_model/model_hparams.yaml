@@ -1,0 +1,22 @@
+input_channels: 2
+embedding_dim: 32
+num_conv_layers: 4
+base_channels: 64
+kernel_size: 7
+stride: 1
+pool_kernel: 3
+fc_hidden_dims:
+- 128
+- 64
+- 128
+- 256
+- 64
+- 512
+fc_dropout: 0.10278174987980382
+hz: 10
+window_size_seconds: 10
+chunk_size_seconds: 30
+train_ride_start_seconds: 0
+lr: 0.003
+batch_size: 32
+weight_decay: 3.470225454953394e-06

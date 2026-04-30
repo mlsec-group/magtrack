@@ -1,0 +1,13 @@
+BootStrap: docker
+From: python:3.13
+
+%post
+    pip install ./
+
+%files
+    ./pyproject.toml
+    ./requirements.txt
+    ./src
+
+%runscript
+    exec python3 "$@"
