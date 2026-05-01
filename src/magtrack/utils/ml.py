@@ -134,13 +134,14 @@ def train_one_epoch_gpu(
     return float((total_loss / max(n_batches, 1)).item())
 
 
-def evaluate(model, signals, pairs, labels, batch_size, threshold=0.0):
+def evaluate(model, signals, pairs, labels, batch_size, threshold=0.0, return_scores=False):
     """GPU-resident evaluation.
 
     signals: (N, L) on device. pairs: (P, 2) long on device. labels: (P,) int on device.
-    Returns a metrics dict.
+    Returns metrics tuple, optionally with (labels_np, scores_np).
     """
-    all_preds: list[int] = []
+    all_preds: list[torch.Tensor] = []
+    all_scores: list[torch.Tensor] = [] if return_scores else None  # type: ignore[assignment]
     with torch.no_grad():
         for start in trange(0, pairs.shape[0], batch_size):
             p = pairs[start:start + batch_size]
@@ -171,7 +172,7 @@ def evaluate(model, signals, pairs, labels, batch_size, threshold=0.0):
     specificity = TN / (TN + FP) if (TN + FP) > 0 else 0.0
     negative_predictive_value = TN / (TN + FN) if (TN + FN) > 0 else 0.0
 
-    return {
+    metrics = {
         "acc": acc,
         "precision": precision,
         "recall": recall,
@@ -186,6 +187,13 @@ def evaluate(model, signals, pairs, labels, batch_size, threshold=0.0):
         "fn": FN,
         "total": total,
     }
+
+    if return_scores:
+        labels_np = labels.cpu().numpy()
+        scores_np = torch.cat(all_scores).cpu().numpy() if all_scores else np.array([])
+        return metrics, labels_np, scores_np
+    else:
+        return metrics
 
 
 def evaluate_with_extras(

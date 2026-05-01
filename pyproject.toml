@@ -8,20 +8,14 @@ dependencies = { file = ["requirements.txt"] }
 
 
 [project.scripts]
+traintrack-dataset = "magtrack.cli.traintrack_dataset:app"
 evaluate-nor-tmd = "magtrack.cli.evaluate_nor_tmd:app"
 create-tmd-dataset = "magtrack.cli.create_tmd_dataset:app"
 evaluate-tmd = "magtrack.cli.evaluate_tmd:app"
 create-colocation-dataset = "magtrack.cli.create_colocation_dataset:app"
 evaluate-coloc-distance = "magtrack.cli.evaluate_coloc_distance:app"
-generate-coloc-distance-jobs = "magtrack.hydra.generate_coloc_distance_jobs:app"
-generate-evaluate-ml-jobs = "magtrack.hydra.generate_evaluate_ml_jobs:app"
-traintrack-dataset = "magtrack.cli.traintrack_dataset:app"
-generate-tables = "magtrack.paper.generate_tables:app"
-generate-latex-vars = "magtrack.paper.generate_latex_vars:app"
-plot-results = "magtrack.paper.plot_results:app"
-plot-heatmaps = "magtrack.paper.plot_heatmaps:app"
-train-ml-model = "magtrack.cli.train_ml_model:app"
 hyperparameter-search = "magtrack.cli.hyperparameter_search:app"
+train-ml-model = "magtrack.cli.train_ml_model:app"
 ml-inference = "magtrack.cli.ml_inference:main"
 evaluate-majority-ml = "magtrack.cli.evaluate_majority_ml:app"
 

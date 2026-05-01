@@ -10,7 +10,7 @@ import typer
 import yaml
 from tqdm import trange, tqdm
 
-from magtrack.utils.coloc_dataset import ColocDataset, ColocSequentialEvalDataset
+from magtrack.utils.coloc_dataset import ColocDataset
 from magtrack.utils.evaluation import train_test_split
 from magtrack.utils.loader import read_pickle
 from magtrack.utils.ml import (
@@ -58,21 +58,6 @@ def _load_split_arrays_impl(path_str: str, test_fraction: float, seed_int: int):
     )
 
 
-def _load_split_arrays(path_str: str, test_fraction: float, seed_int: int):
-    """Cache-fronted loader. Returns the same tuple as `_load_split_arrays_impl`.
-
-    Hits `_array_cache` after the parallel preload populates it; otherwise
-    falls back to a serial in-process load (e.g. for paths missed by preload).
-    """
-    key = (path_str, test_fraction, seed_int)
-    cached = _array_cache.get(key)
-    if cached is not None:
-        return cached
-    result = _load_split_arrays_impl(path_str, test_fraction, seed_int)
-    _array_cache[key] = result
-    return result
-
-
 def _preload_all_datasets(base_data_dir: Path, test_fraction: float, seed_int: int, n_jobs: int) -> None:
     """Parallel preload of every existing dataset file across the search space.
 
@@ -112,28 +97,6 @@ def _preload_all_datasets(base_data_dir: Path, test_fraction: float, seed_int: i
                 desc="Preloading datasets",
         ):
             _array_cache[(path_str, test_fraction, seed_int)] = arrays
-
-
-@lru_cache(maxsize=8)
-def _load_split_arrays(path_str: str, test_fraction: float, seed_int: int):
-    """Load + split + pair-build a dataset, cached across trials.
-
-    Returns numpy arrays (signals/ids) and positive-pair index arrays for
-    train/test. Identical (path, test_fraction, seed_int) triples reuse the
-    cached result, skipping the expensive pickle/stack/groupby work.
-    """
-    df = read_pickle(Path(path_str))
-    train_df, _ = train_test_split(df, test_frac=test_fraction, random_state=seed_int)
-    sampled_idx = train_df.sample(frac=test_fraction, random_state=seed_int, replace=False).index
-    test_df = train_df.loc[sampled_idx].reset_index(drop=True)
-    train_df = train_df.drop(index=sampled_idx).reset_index(drop=True)
-
-    train_ds = ColocSequentialEvalDataset(train_df)
-    test_ds = ColocSequentialEvalDataset(test_df)
-    return (
-        train_ds.signals, train_ds.ids, train_ds.positive_pairs,
-        test_ds.signals, test_ds.ids, test_ds.positive_pairs,
-    )
 
 
 def _preload_worker(args):
@@ -207,14 +170,14 @@ def _pool1d_out_length(length, kernel_size, stride, padding=0, dilation=1):
 @app.command("optimize")
 def optimize_simple_cnn(
         base_data_dir: Path = typer.Option(
-            "/shares/research/magtrack2/anonym_coloc_datasets/normalized_trace_all_trains/",
+            "datasets/coloc_datasets/",
             help="Base path for all datasets"),
         test_fraction: float = typer.Option(0.3, help="Fraction of data to use for testing"),
         seed: str = typer.Option("magtrack", help="Random seed string for reproducibility (converted to int)"),
         n_trials: int = typer.Option(1_000, help="Number of Optuna trials"),
         timeout: int = typer.Option(0, help="Timeout in seconds (0 = no timeout)"),
         max_epochs: int = typer.Option(200, help="Max epochs per trial"),
-        num_gpus: int = typer.Option(1, help="Number of GPUs to parallelize trials across (0 for CPU)"),
+        num_gpus: int = typer.Option(0, help="Number of GPUs to parallelize trials across (0 for CPU)"),
         n_jobs: int = typer.Option(1,
                                    help="Number of concurrent Optuna trials (threads). On a single GPU, 2-4 typically saturates it."),
 ):
@@ -389,7 +352,7 @@ def optimize_simple_cnn(
     # and cannot randomly prune trials based on incomplete data without breaking the evolution.
     study = optuna.create_study(
         study_name="colocoation_cnn_hyperparameter_search",
-        storage="sqlite:///ultra_parallel_paper_letsgo.db",
+        storage="sqlite:///optuna_search.db",
         load_if_exists=True,
         directions=["maximize", "minimize", "minimize"],
         sampler=sampler

@@ -209,6 +209,9 @@ def train(
         eval_every=5,
         roc_fig_every=25,
 ):
+    losses = []
+    epoch_losses = []
+
     model.to(device)
     model.train()
 
@@ -289,30 +292,20 @@ def train(
         do_eval = (epoch % max(1, int(eval_every)) == 0) or (epoch == epochs - 1)
         if do_eval:
             model.eval()
-            need_scores = (epoch % max(1, int(roc_fig_every)) == 0) or (epoch == epochs - 1)
-            if need_scores:
-                metrics, labels_np, scores_np = evaluate(
-                    model, test_signals, test_pairs, test_labels, batch_size,
-                    threshold=0.0, return_scores=True,
-                )
-                _log_roc_from_arrays(writer, labels_np, scores_np, epoch)
-            else:
-                metrics = evaluate(
-                    model, test_signals, test_pairs, test_labels, batch_size,
-                    threshold=0.0, return_scores=False,
-                )
-            (
-                test_accuracy,
-                precision,
-                recall,
-                f1,
-                prevalence,
-                specificity,
-                negative_predictive_value,
-                mcc,
-            ) = metrics
+            metrics = evaluate(
+                model, test_signals, test_pairs, test_labels, batch_size,
+                threshold=0.0, return_scores=False,
+            )
+
             last_metrics = metrics
-            test_mcc = mcc
+            test_accuracy = metrics["acc"]
+            precision = metrics["precision"]
+            recall = metrics["recall"]
+            f1 = metrics["f1"]
+            prevalence = metrics["prevalence"]
+            specificity = metrics["specificity"]
+            negative_predictive_value = metrics["npv"]
+            test_mcc = metrics['mcc']
 
             writer.add_scalar("Test/Accuracy", test_accuracy, epoch)
             writer.add_scalar("Test/Precision", precision, epoch)
@@ -321,21 +314,19 @@ def train(
             writer.add_scalar("Test/Prevalence", prevalence, epoch)
             writer.add_scalar("Test/Specificity", specificity, epoch)
             writer.add_scalar("Test/Negative_Predictive_value", negative_predictive_value, epoch)
-            writer.add_scalar("Test/MCC", mcc, epoch)
+            writer.add_scalar("Test/MCC", test_mcc, epoch)
             model.train()
         else:
             if last_metrics is None:
                 continue
-            (
-                test_accuracy,
-                precision,
-                recall,
-                f1,
-                prevalence,
-                specificity,
-                negative_predictive_value,
-                mcc,
-            ) = last_metrics
+            test_accuracy = last_metrics["acc"]
+            precision = last_metrics["precision"]
+            recall = last_metrics["recall"]
+            f1 = last_metrics["f1"]
+            prevalence = last_metrics["prevalence"]
+            specificity = last_metrics["specificity"]
+            negative_predictive_value = last_metrics["npv"]
+            test_mcc = last_metrics['mcc']
 
         if test_mcc > best_mcc:
             best_mcc = test_mcc

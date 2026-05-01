@@ -12,6 +12,15 @@ import numpy as np
 import optuna
 import pandas as pd
 import typer
+from magtrack.utils.evaluation import train_test_split, find_best_threshold_snr
+from magtrack.utils.loader import read_pickle, get_metadata_from_dataset
+from magtrack.utils.tmd_functions import (
+    compute_fft_spectrum,
+    compute_psd_spectrum,
+    compute_snr_from_spectrum,
+    compute_snr_goertzel,
+)
+from magtrack.utils.utils import resolve_seed
 from sklearn.metrics import (
     accuracy_score,
     confusion_matrix,
@@ -21,15 +30,6 @@ from sklearn.metrics import (
     recall_score,
 )
 from tqdm import tqdm
-
-from magtrack.utils.evaluation import train_test_split, find_best_threshold_snr
-from magtrack.utils.loader import read_pickle, get_metadata_from_dataset
-from magtrack.utils.tmd_functions import (
-    compute_fft_spectrum,
-    compute_psd_spectrum,
-    compute_snr_from_spectrum,
-    compute_snr_goertzel,
-)
 
 # Discrete nperseg choices for the PSD search.  Spectra for each value are
 # precomputed once before Optuna starts; the search picks among them as a

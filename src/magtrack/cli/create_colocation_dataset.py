@@ -87,7 +87,7 @@ def create(
         trainride_start_seconds: int = typer.Option(0, help="Seconds to use from the start of trainride (0 = all)"),
         output_path: Path = typer.Option(..., help="Path or file, where ml_datasets will be stored"),
         sensor_type: str = typer.Option("Magnetometer", help="Sensor type to extract from zipfiles"),
-        filter_train_type: list[str] = typer.Option(['long_distance'],
+        filter_train_type: list[str] = typer.Option(['long_distance', 'regional'],
                                                     help="List of train types to include (long-distance, regional...). If not set, all train types are included."),
         dataset_name: str = typer.Option("magtrack", help="Name of the dataset (used in output filename)"),
         start_delay: int = typer.Option(2, help="Seconds to delay from recording start"),
