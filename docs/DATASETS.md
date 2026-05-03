@@ -28,18 +28,14 @@ The `electric` column encodes the electrification (16.7 Hz) status of the train 
 TMD (transport-mode detection) datasets used for the TMD examples and evaluation. Example files included:
 ```
   - `tmd_s60_d10_small.pkl`
-  - `tmd_s60_d10_small.meta.csv`
-  - `tmd_s60_d10_small.cache.duckdb`
 ```
 
 #### Colocation Datasets
 
 prebuilt colocation datasets (pickle files). Example files included:
 ```
+  - `all_coloc_first0_30s_window10_10Hz.pkl`
   - `all_coloc_first300_60s_window10_40Hz.pkl`
-  - `all_coloc_first300_60s_window10_40Hz.meta.csv`
   - `all_coloc_first60_5s_window50_40Hz.pkl`
-  - `all_coloc_first60_5s_window50_40Hz.meta.csv`
-  - `all_coloc_first60_5s_window50_40Hz.cache.duckdb`
 ```
 
