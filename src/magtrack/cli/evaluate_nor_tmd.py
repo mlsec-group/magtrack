@@ -71,7 +71,7 @@ def _import_csv(conn: duckdb.DuckDBPyConnection, db_name: str,
     with zipfile.ZipFile(zip_path) as z:
         with z.open(csv_file) as f:
             with pd.read_csv(
-                f, chunksize=chunk_size, dtype={"activity_recognition": "string"}
+                    f, chunksize=chunk_size, dtype={"activity_recognition": "string"}
             ) as reader:
                 for chunk_num, chunk in enumerate(reader, start=1):
                     selected_columns = chunk.drop(columns=["activity_recognition"])
@@ -158,7 +158,7 @@ def _calculate_magnitude(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _segment_and_aggregate(
-    df: pd.DataFrame, window_len_sec: int = 10, overlap_sec: int = 5, centered: bool = False
+        df: pd.DataFrame, window_len_sec: int = 10, overlap_sec: int = 5, centered: bool = False
 ) -> pd.DataFrame:
     group_columns = ["installationId", "journeyNumber", "tripNumber", "typeInteger"]
     other_columns = [
@@ -237,19 +237,19 @@ def _pivot_sensors_to_columns(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFr
 
 
 def _filter_trip_durations(
-    df: pd.DataFrame, min_seconds: int = 60, max_seconds: int = 3600
+        df: pd.DataFrame, min_seconds: int = 60, max_seconds: int = 3600
 ) -> pd.DataFrame:
     trip_durations = df.groupby(
         ["installationId", "journeyNumber", "tripNumber"]
     )["timestamp"].agg(start_time="min", end_time="max")
     trip_durations["duration_seconds"] = (
-        trip_durations["end_time"] - trip_durations["start_time"]
+            trip_durations["end_time"] - trip_durations["start_time"]
     ).dt.total_seconds()
 
     valid_trips = trip_durations[
         (trip_durations["duration_seconds"] >= min_seconds)
         & (trip_durations["duration_seconds"] <= max_seconds)
-    ].index
+        ].index
 
     mask = df.set_index(
         ["installationId", "journeyNumber", "tripNumber"]

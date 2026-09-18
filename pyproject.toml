@@ -6,16 +6,32 @@ dynamic = ["dependencies"]
 [tool.setuptools.dynamic]
 dependencies = { file = ["requirements.txt"] }
 
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [project.scripts]
-traintrack-dataset = "magtrack.cli.traintrack_dataset:app"
 evaluate-nor-tmd = "magtrack.cli.evaluate_nor_tmd:app"
 create-tmd-dataset = "magtrack.cli.create_tmd_dataset:app"
 evaluate-tmd = "magtrack.cli.evaluate_tmd:app"
+fast-evaluation = "magtrack.cli.fast_evaluation:app"
 create-colocation-dataset = "magtrack.cli.create_colocation_dataset:app"
+create-colocation-datasets = "magtrack.cli.create_colocation_datasets:app"
 evaluate-coloc-distance = "magtrack.cli.evaluate_coloc_distance:app"
-hyperparameter-search = "magtrack.cli.hyperparameter_search:app"
+benchmark-inference = "magtrack.cli.benchmark_inference:app"
+generate-coloc-distance-jobs = "magtrack.hydra.generate_coloc_distance_jobs:app"
+generate-evaluate-ml-jobs = "magtrack.cli.generate_evaluate_ml_jobs:app"
+generate-majority-vote-jobs = "magtrack.cli.generate_majority_vote_jobs:app"
+traintrack-dataset = "magtrack.cli.traintrack_dataset:app"
+generate-tables = "magtrack.paper.generate_tables:app"
+generate-latex-vars = "magtrack.paper.generate_latex_vars:app"
+plot-results = "magtrack.paper.plot_results:app"
+plot-heatmaps = "magtrack.paper.plot_heatmaps:app"
+plot-metric-heatmaps = "magtrack.paper.heatmaps:app"
+plot-majority-ml = "magtrack.paper.plot_majority_ml:app"
+generate-longvsregional-table = "magtrack.paper.generate_longvsregional_table:main"
+generate-hparam-search-table = "magtrack.paper.generate_hparam_search_table:app"
 train-ml-model = "magtrack.cli.train_ml_model:app"
+hyperparameter-search = "magtrack.cli.hyperparameter_search:app"
 ml-inference = "magtrack.cli.ml_inference:main"
 evaluate-majority-ml = "magtrack.cli.evaluate_majority_ml:app"
 

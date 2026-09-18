@@ -10,7 +10,7 @@ import typer
 import yaml
 from tqdm import trange, tqdm
 
-from magtrack.utils.coloc_dataset import ColocDataset
+from magtrack.utils.coloc_dataset import ColocDataset, ColocSequentialEvalDataset
 from magtrack.utils.evaluation import train_test_split
 from magtrack.utils.loader import read_pickle
 from magtrack.utils.ml import (
@@ -34,8 +34,6 @@ def _dataset_path(base_data_dir: Path, start: int, chunk: int, window: int, hz: 
     return base_data_dir / f"all_coloc_first{start}_{chunk}s_window{window}_{hz}Hz.pkl"
 
 
-# Process-shared array cache. Populated by the parallel preload step and read
-# by trials in the main process; threads (Optuna n_jobs > 1) share it safely.
 _array_cache: dict[tuple, tuple] = {}
 
 
@@ -56,6 +54,21 @@ def _load_split_arrays_impl(path_str: str, test_fraction: float, seed_int: int):
         train_ds.signals, train_ds.ids, train_ds.positive_pairs,
         test_ds.signals, test_ds.ids, test_ds.positive_pairs,
     )
+
+
+def _load_split_arrays(path_str: str, test_fraction: float, seed_int: int):
+    """Cache-fronted loader. Returns the same tuple as `_load_split_arrays_impl`.
+
+    Hits `_array_cache` after the parallel preload populates it; otherwise
+    falls back to a serial in-process load (e.g. for paths missed by preload).
+    """
+    key = (path_str, test_fraction, seed_int)
+    cached = _array_cache.get(key)
+    if cached is not None:
+        return cached
+    result = _load_split_arrays_impl(path_str, test_fraction, seed_int)
+    _array_cache[key] = result
+    return result
 
 
 def _preload_all_datasets(base_data_dir: Path, test_fraction: float, seed_int: int, n_jobs: int) -> None:
@@ -88,7 +101,6 @@ def _preload_all_datasets(base_data_dir: Path, test_fraction: float, seed_int: i
             _array_cache[(path_str, test_fraction, seed_int)] = arrays
         return
 
-    # Spawn context so child processes don't inherit a CUDA-initialized parent.
     ctx = mp.get_context("spawn")
     with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as ex:
         for path_str, arrays in tqdm(
@@ -97,6 +109,28 @@ def _preload_all_datasets(base_data_dir: Path, test_fraction: float, seed_int: i
                 desc="Preloading datasets",
         ):
             _array_cache[(path_str, test_fraction, seed_int)] = arrays
+
+
+@lru_cache(maxsize=8)
+def _load_split_arrays(path_str: str, test_fraction: float, seed_int: int):
+    """Load + split + pair-build a dataset, cached across trials.
+
+    Returns numpy arrays (signals/ids) and positive-pair index arrays for
+    train/test. Identical (path, test_fraction, seed_int) triples reuse the
+    cached result, skipping the expensive pickle/stack/groupby work.
+    """
+    df = read_pickle(Path(path_str))
+    train_df, _ = train_test_split(df, test_frac=test_fraction, random_state=seed_int)
+    sampled_idx = train_df.sample(frac=test_fraction, random_state=seed_int, replace=False).index
+    test_df = train_df.loc[sampled_idx].reset_index(drop=True)
+    train_df = train_df.drop(index=sampled_idx).reset_index(drop=True)
+
+    train_ds = ColocSequentialEvalDataset(train_df)
+    test_ds = ColocSequentialEvalDataset(test_df)
+    return (
+        train_ds.signals, train_ds.ids, train_ds.positive_pairs,
+        test_ds.signals, test_ds.ids, test_ds.positive_pairs,
+    )
 
 
 def _preload_worker(args):
@@ -167,19 +201,65 @@ def _pool1d_out_length(length, kernel_size, stride, padding=0, dilation=1):
     return ((length + 2 * padding - dilation * (kernel_size - 1) - 1) // stride) + 1
 
 
+def _hparams_from_trial(trial) -> dict:
+    """Format one Optuna trial's parameters as the model hyperparameter dict.
+
+    Shared by the search and by ``fast-evaluation`` so both derive the same
+    YAML from the same trial.
+    """
+    h = trial.params
+    fc_hidden_dims = [h[f"fc_dim_{i}"] for i in range(h["fc_layers"])]
+    return {
+        "input_channels": 2,
+        "embedding_dim": h["embedding_dim"],
+        "num_conv_layers": h["num_conv_layers"],
+        "base_channels": h.get("base_channels"),
+        "kernel_size": h.get("kernel_size"),
+        "stride": h.get("stride"),
+        "pool_kernel": h.get("pool_kernel"),
+        "fc_hidden_dims": fc_hidden_dims,
+        "fc_dropout": h["fc_dropout"],
+
+        # Dataset & Optimization parameters
+        "hz": h["hz"],
+        "window_size_seconds": h["window_size_seconds"],
+        "chunk_size_seconds": h["chunk_size_seconds"],
+        "train_ride_start_seconds": h["train_ride_start_seconds"],
+        "lr": h["lr"],
+        "batch_size": h["batch_size"],
+        "weight_decay": h["weight_decay"],
+    }
+
+
+def _best_trial_by_mcc(study):
+    """The Pareto-front trial with the highest MCC — the search's own choice."""
+    best_trials = study.best_trials
+    if not best_trials:
+        return None, 0
+    return max(best_trials, key=lambda t: t.values[0]), len(best_trials)
+
+
 @app.command("optimize")
 def optimize_simple_cnn(
         base_data_dir: Path = typer.Option(
-            "datasets/coloc_datasets/",
+            "/path/to/colocation/datasets/",
             help="Base path for all datasets"),
         test_fraction: float = typer.Option(0.3, help="Fraction of data to use for testing"),
         seed: str = typer.Option("magtrack", help="Random seed string for reproducibility (converted to int)"),
         n_trials: int = typer.Option(1_000, help="Number of Optuna trials"),
         timeout: int = typer.Option(0, help="Timeout in seconds (0 = no timeout)"),
         max_epochs: int = typer.Option(200, help="Max epochs per trial"),
-        num_gpus: int = typer.Option(0, help="Number of GPUs to parallelize trials across (0 for CPU)"),
+        num_gpus: int = typer.Option(1, help="Number of GPUs to parallelize trials across (0 for CPU)"),
         n_jobs: int = typer.Option(1,
                                    help="Number of concurrent Optuna trials (threads). On a single GPU, 2-4 typically saturates it."),
+        hparams_output: Path = typer.Option(
+            Path("./results/model_hparams.yaml"),
+            help="Path to save the best hyperparameters YAML file.",
+        ),
+        db_output: Path = typer.Option(
+            Path("hyperparam_search.db"),
+            help="Path to save the Optuna SQLite database.",
+        ),
 ):
     seed_int = resolve_seed(seed)
     np.random.seed(seed_int)
@@ -203,13 +283,8 @@ def optimize_simple_cnn(
 
     device = 'cuda' if has_cuda and num_gpus > 0 else 'cpu'
 
-    # Parallel-preload every existing dataset before any CUDA work begins.
-    # Workers fork off cleanly because CUDA hasn't been initialized yet here
-    # (Optuna trials are what trigger the first CUDA allocation).
     _preload_all_datasets(base_data_dir, test_fraction, seed_int, n_jobs)
 
-    # Move all preloaded datasets to GPU once, in the main thread, so concurrent
-    # trials never have to do H2D transfers (or contend on the lru_cache lock).
     if device == "cuda":
         _prewarm_gpu_cache(test_fraction, seed_int, "cuda:0")
 
@@ -321,10 +396,24 @@ def optimize_simple_cnn(
             )
 
             model.eval()
-            acc, precision, recall, f1, prevalence, specificity, negative_predictive_value, mcc = evaluate(
+            metrics = evaluate(
                 model, test_signals, test_pairs, test_labels, batch_size, threshold=0.0,
             )
             model.train()
+
+            acc = metrics["acc"]
+            precision = metrics["precision"]
+            recall = metrics["recall"]
+            f1 = metrics["f1"]
+            prevalence = metrics["prevalence"]
+            specificity = metrics["specificity"]
+            npv = metrics["npv"]
+            mcc = metrics["mcc"]
+            tp = metrics["tp"]
+            fp = metrics["fp"]
+            tn = metrics["tn"]
+            fn = metrics["fn"]
+            total = metrics["total"]
 
             best_mcc = max(best_mcc, mcc)
 
@@ -345,14 +434,11 @@ def optimize_simple_cnn(
         # 1. Maximize MCC, 2. Minimize epoch loss, 3. Minimize epoch of early stopping
         return float(best_mcc), float(epoch_loss), stopped_epoch
 
-    # Use NSGA-II for multi-objective optimization
     sampler = optuna.samplers.NSGAIISampler(seed=seed_int)
 
-    # We must remove the MedianPruner. Genetic algorithms need to evaluate full populations 
-    # and cannot randomly prune trials based on incomplete data without breaking the evolution.
     study = optuna.create_study(
-        study_name="colocoation_cnn_hyperparameter_search",
-        storage="sqlite:///optuna_search.db",
+        study_name="colocoation_cnn_param_search",
+        storage=f"sqlite:///{db_output}",
         load_if_exists=True,
         directions=["maximize", "minimize", "minimize"],
         sampler=sampler
@@ -375,46 +461,15 @@ def optimize_simple_cnn(
         print(
             f"  MCC: {best_trial.values[0]:.4f} | epoch_loss: {best_trial.values[1]:.4f} | stopped_epoch: {best_trial.values[2]:.0f}")
 
-        # Extract and format hyperparameters to save to YAML
-        h = best_trial.params
-        num_conv_layers = h['num_conv_layers']
-        base_channels = h.get('base_channels')
-        kernel_size = h.get('kernel_size')
-        stride = h.get('stride')
-        pool_kernel = h.get('pool_kernel')
+        hparams_dict = _hparams_from_trial(best_trial)
 
-        fc_layers = h['fc_layers']
-        fc_hidden_dims = [h[f"fc_dim_{i}"] for i in range(fc_layers)]
+        results_dir = hparams_output.parent
+        results_dir.mkdir(parents=True, exist_ok=True)
 
-        hparams_dict = {
-            "input_channels": 2,
-            "embedding_dim": h["embedding_dim"],
-            "num_conv_layers": num_conv_layers,
-            "base_channels": base_channels,
-            "kernel_size": kernel_size,
-            "stride": stride,
-            "pool_kernel": pool_kernel,
-            "fc_hidden_dims": fc_hidden_dims,
-            "fc_dropout": h["fc_dropout"],
-
-            # Dataset & Optimization parameters
-            "hz": h["hz"],
-            "window_size_seconds": h["window_size_seconds"],
-            "chunk_size_seconds": h["chunk_size_seconds"],
-            "train_ride_start_seconds": h["train_ride_start_seconds"],
-            "lr": h["lr"],
-            "batch_size": h["batch_size"],
-            "weight_decay": h["weight_decay"],
-        }
-
-        results_dir = Path("./results")
-        results_dir.mkdir(exist_ok=True)
-        hparams_path = results_dir / "model_hparams.yaml"
-
-        with open(hparams_path, "w", encoding="utf-8") as f:
+        with open(hparams_output, "w", encoding="utf-8") as f:
             yaml.dump(hparams_dict, f, sort_keys=False)
 
-        print(f"Saved best hyperparameters to {hparams_path}")
+        print(f"Saved best hyperparameters to {hparams_output}")
 
 
 if __name__ == "__main__":

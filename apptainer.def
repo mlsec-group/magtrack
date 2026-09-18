@@ -2,7 +2,16 @@ BootStrap: docker
 From: python:3.13
 
 %post
-    pip install ./
+    apt-get update
+    apt-get install -y parallel locales
+    sed -i '/en_US.UTF-8/s/^# //' /etc/locale.gen
+    locale-gen
+    pip install --no-cache-dir ./
+    rm -rf /var/lib/apt/lists/*
+
+%environment
+    export LANG=en_US.UTF-8
+    export LC_ALL=en_US.UTF-8
 
 %files
     ./pyproject.toml

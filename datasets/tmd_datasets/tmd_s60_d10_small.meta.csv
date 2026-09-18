@@ -1,2 +1,0 @@
-trainride_dataset_name,no_trainride_dataset_name,dataset_md5,duration,min_sample_frequency,only_complete_recordings,trainride_start_seconds,balanced,seed,num_samples,num_trainride_samples,num_no_trainride_samples,no_train_activity
-dataset,dataset,2563f962f32fde42819c4eb834892086,10,90.0,True,60,False,magtrack,7598,2158,5440,"{'cycling': 26728.290000488294, 'stationary': 102960.27899999998, 'unknown': 80662.94901025388, 'walking': 29183.049993896493, 'automotive': 29890.300995605467, 'tilting': 8.623000244137037}"

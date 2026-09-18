@@ -4,6 +4,9 @@ from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import numpy as np
+import fcntl
+import os
+
 import pandas as pd
 import torch
 
@@ -21,6 +24,7 @@ from magtrack.utils.utils import resolve_seed
 def _build_sequential_arrays(df):
     dataset = ColocSequentialEvalDataset(df)
     return dataset.signals, dataset.ids, dataset.positive_pairs
+
 
 def _build_split_arrays(df, workers: int):
     if workers <= 1:
@@ -44,17 +48,21 @@ def _get_gpu_split_from_dfs(df, device: str, seed_int: int, preload_workers: int
         return signals, pairs, labels
     return signals, ids, pos_pairs
 
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset-path", type=Path, required=True, help="Path to the dataset .pkl file")
     parser.add_argument("--model-path", type=Path, required=True, help="Path to the trained PyTorch model (.pth)")
-    parser.add_argument("--hparams-path", type=Path, default=Path("./coloc_model/model_hparams.yaml"), help="Path to the model hparams yaml")
+    parser.add_argument("--hparams-path", type=Path, default=Path("./coloc_model/model_hparams.yaml"),
+                        help="Path to the model hparams yaml")
     parser.add_argument("--test-fraction", type=float, default=0.3, help="Fraction of data to use for testing")
     parser.add_argument("--threshold", type=float, default=0.0, help="Logit threshold for binary classification")
     parser.add_argument("--batch-size", type=int, default=1024, help="Batch size for evaluation")
     parser.add_argument("--seed", type=str, default="magtrack", help="Random seed for fixing the train/test split")
-    parser.add_argument("--n-jobs", type=int, default=32, help="Worker processes for parallel signal stacking when building the eval dataset (1 = serial).")
-    parser.add_argument("--results-dir", type=Path, default=Path("./results"), help="Directory to save evaluation results (e.g. metrics, plots)")
+    parser.add_argument("--n-jobs", type=int, default=32,
+                        help="Worker processes for parallel signal stacking when building the eval dataset (1 = serial).")
+    parser.add_argument("--results-dir", type=Path, default=Path("./results"),
+                        help="Directory to save evaluation results (e.g. metrics, plots)")
 
     args = parser.parse_args()
 
@@ -69,10 +77,7 @@ def main():
     preload_workers = args.n_jobs
 
     results_dir.mkdir(parents=True, exist_ok=True)
-    # If the user passed a single directory (and nothing else), name the CSV
-    # after that directory, matching the previous --dataset-dir behavior.
     results_csv_path = results_dir / "evaluation_results.results_ml.csv"
-    write_header = not results_csv_path.exists()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -91,10 +96,10 @@ def main():
     data["class"] = codes
 
     train_df, test_df = train_test_split(
-            data,
-            test_frac=test_fraction,
-            random_state=seed_int,
-        )
+        data,
+        test_frac=test_fraction,
+        random_state=seed_int,
+    )
 
     train_ids = set(train_df["id"].unique())
     test_ids = set(test_df["id"].unique())
@@ -104,7 +109,8 @@ def main():
     else:
         print("No overlapping ids found between train and test.")
 
-    test_signals, test_pairs, test_labels = _get_gpu_split_from_dfs(test_df, device, seed_int, preload_workers, test=True)
+    test_signals, test_pairs, test_labels = _get_gpu_split_from_dfs(test_df, device, seed_int, preload_workers,
+                                                                    test=True)
 
     if device == "cuda":
         torch.cuda.synchronize()
@@ -118,12 +124,12 @@ def main():
     model.eval()
 
     metrics = evaluate(
-            model,
-            test_signals,
-            test_pairs,
-            test_labels,
-            batch_size,
-            threshold=0.0,
+        model,
+        test_signals,
+        test_pairs,
+        test_labels,
+        batch_size,
+        threshold=0.0,
     )
 
     print(f"Evaluation results for {dataset_path.name} (Seed {seed_int}):")
@@ -137,24 +143,36 @@ def main():
     print(f"  MCC:           {metrics['mcc']:.4f}")
 
     row = {
-            'seed': seed_int,
-            'dataset_file': dataset_path.name,
-            'accuracy': metrics['acc'],
-            'f1': metrics['f1'],
-            'mcc': metrics['mcc'],
-            'precision': metrics['precision'],
-            'recall': metrics['recall'],
-            'specificity': metrics['specificity'],
-            'negative_predictive_value': metrics['npv'],
-            'prevalence': metrics['prevalence'],
-            'TP': metrics['tp'],
-            'FP': metrics['fp'],
-            'TN': metrics['tn'],
-            'FN': metrics['fn'],
-            'samples': metrics['total'],
-        }
+        'seed': seed_int,
+        'dataset_file': dataset_path.name,
+        'accuracy': metrics['acc'],
+        'f1': metrics['f1'],
+        'mcc': metrics['mcc'],
+        'precision': metrics['precision'],
+        'recall': metrics['recall'],
+        'specificity': metrics['specificity'],
+        'negative_predictive_value': metrics['npv'],
+        'prevalence': metrics['prevalence'],
+        'TP': metrics['tp'],
+        'FP': metrics['fp'],
+        'TN': metrics['tn'],
+        'FN': metrics['fn'],
+        'samples': metrics['total'],
+    }
 
-    pd.DataFrame([row]).to_csv(results_csv_path, mode='a', header=write_header, index=False)
+    # Parallel jobs all append to this one CSV. Decide the header inside an
+    # exclusive lock and from the file's actual size: checking os.path.exists()
+    # up front lets every job that starts before the first write conclude the
+    # file is missing, and each writes its own header row.
+    results_csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(results_csv_path, "a", newline="") as results_fh:
+        fcntl.flock(results_fh.fileno(), fcntl.LOCK_EX)
+        try:
+            write_header = os.fstat(results_fh.fileno()).st_size == 0
+            pd.DataFrame([row]).to_csv(results_fh, header=write_header, index=False)
+        finally:
+            fcntl.flock(results_fh.fileno(), fcntl.LOCK_UN)
+
 
 if __name__ == "__main__":
     main()

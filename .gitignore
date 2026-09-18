@@ -1,0 +1,9 @@
+/datasets/
+/traintrack-zenodo/
+/traintrack-dataset/
+/no-trainride-dataset/
+/results/
+/scripts/coloc_ml/tmp/
+python.sif
+nor-tmd.zip
+__pycache__/

@@ -261,8 +261,6 @@ def create(
                     f"Segment {seg_id} has invalid sampling rate in some chunks. Skipping this segment due to trainride_start_seconds > 0.")
                 continue
 
-            # Use the latest chunk start across all colocated files as the shared downsampling origin,
-            # so all files are aligned to the same time grid.
             downsampling_origin_by_chunk = {}
             for chunk_df_for_file in segment_chunk_dfs.values():
                 if chunk_df_for_file.empty:

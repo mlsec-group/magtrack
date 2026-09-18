@@ -63,19 +63,16 @@ def find_best_threshold_snr(
     scores_sorted = scores_finite[order]
     y_sorted = y_finite[order].astype(np.int64)
 
-    # Prefix sums prepended with 0: cum_pos[k] / cum_neg[k] = counts in [0, k).
     cum_pos = np.concatenate(([0], np.cumsum(y_sorted))).astype(np.int64)
     cum_neg = np.concatenate(([0], np.cumsum(1 - y_sorted))).astype(np.int64)
     p_finite = int(cum_pos[-1])
     n_finite = int(cum_neg[-1])
     n_sorted = scores_sorted.size
 
-    # Group sorted samples by unique score; cuts sit between groups.
     uniq_vals, counts = np.unique(scores_sorted, return_counts=True)
     group_ends = np.cumsum(counts).astype(np.int64)
 
     if uniq_vals.size == 1:
-        # Mirror compute_threshold_candidates([v]) → [v-eps, v, v+eps].
         cuts = np.array([0, 0, n_sorted], dtype=np.int64)
         candidates = np.array(
             [uniq_vals[0] - eps, uniq_vals[0], uniq_vals[0] + eps],
@@ -88,7 +85,6 @@ def find_best_threshold_snr(
             ([uniq_vals[0] - eps], midpoints, [uniq_vals[-1] + eps])
         ).astype(np.float64)
 
-    # Confusion-matrix arrays for every candidate.
     tp = (p_finite - cum_pos[cuts]).astype(np.float64)
     fp = (n_finite - cum_neg[cuts]).astype(np.float64)
     fn = float(total_pos) - tp
@@ -108,7 +104,7 @@ def find_best_threshold_snr(
 
 
 def train_test_split(data: pd.DataFrame, test_frac: float, random_state: int, split_column: str = 'segment_id') -> \
-Tuple[pd.DataFrame, pd.DataFrame]:
+        Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Split the data into training and testing sets based on unique IDs.
     Parameters:
@@ -192,7 +188,8 @@ def find_best_threshold(dist_flat: np.ndarray, gt_flat: np.ndarray, metric: str)
     TN = m["TN"].astype(np.float64)
     FN = m["FN"].astype(np.float64)
     denom = np.sqrt((TP + FP) * (TP + FN) * (TN + FP) * (TN + FN))
-    mcc_arr = np.where(denom > 0.0, (TP * TN - FP * FN) / denom, 0.0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mcc_arr = np.where(denom > 0.0, (TP * TN - FP * FN) / denom, 0.0)
     score_arr = m["f1_pos_arr"] if metric == "f1" else mcc_arr
     idx = int(np.argmax(score_arr))
     stats = {
@@ -255,19 +252,20 @@ def compute_threshold_metrics_for_train(dist_f_train: np.ndarray, gt_f_train: np
     FN = total_pos - TP
     TN = total_neg - FP
 
-    precision_pos = np.where((TP + FP) > 0, TP / (TP + FP), 0.0)
-    recall_pos = np.where((TP + FN) > 0, TP / (TP + FN), 0.0)
-    f1_pos_arr = np.where((precision_pos + recall_pos) > 0,
-                          (2 * precision_pos * recall_pos) / (precision_pos + recall_pos), 0.0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        precision_pos = np.where((TP + FP) > 0, TP / (TP + FP), 0.0)
+        recall_pos = np.where((TP + FN) > 0, TP / (TP + FN), 0.0)
+        f1_pos_arr = np.where((precision_pos + recall_pos) > 0,
+                              (2 * precision_pos * recall_pos) / (precision_pos + recall_pos), 0.0)
 
-    precision_neg = np.where((TN + FN) > 0, TN / (TN + FN), 0.0)
-    recall_neg = np.where((TN + FP) > 0, TN / (TN + FP), 0.0)
-    f1_neg_arr = np.where((precision_neg + recall_neg) > 0,
-                          (2 * precision_neg * recall_neg) / (precision_neg + recall_neg), 0.0)
+        precision_neg = np.where((TN + FN) > 0, TN / (TN + FN), 0.0)
+        recall_neg = np.where((TN + FP) > 0, TN / (TN + FP), 0.0)
+        f1_neg_arr = np.where((precision_neg + recall_neg) > 0,
+                              (2 * precision_neg * recall_neg) / (precision_neg + recall_neg), 0.0)
 
-    f1_macro_arr = (f1_pos_arr + f1_neg_arr) / 2.0
-    denom = (TP + TN + FP + FN)
-    acc_arr = np.where(denom > 0, (TP + TN) / denom, 0.0)
+        f1_macro_arr = (f1_pos_arr + f1_neg_arr) / 2.0
+        denom = (TP + TN + FP + FN)
+        acc_arr = np.where(denom > 0, (TP + TN) / denom, 0.0)
 
     return {
         'TP': TP,

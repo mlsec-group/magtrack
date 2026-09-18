@@ -12,28 +12,19 @@ import numpy as np
 import optuna
 import pandas as pd
 import typer
+from scipy.interpolate import UnivariateSpline
+from sklearn.metrics import confusion_matrix
+from tqdm import tqdm
+
 from magtrack.utils.evaluation import train_test_split, find_best_threshold_snr
 from magtrack.utils.loader import read_pickle, get_metadata_from_dataset
 from magtrack.utils.tmd_functions import (
     compute_fft_spectrum,
     compute_psd_spectrum,
-    compute_snr_from_spectrum,
     compute_snr_goertzel,
 )
 from magtrack.utils.utils import resolve_seed
-from sklearn.metrics import (
-    accuracy_score,
-    confusion_matrix,
-    f1_score,
-    matthews_corrcoef,
-    precision_score,
-    recall_score,
-)
-from tqdm import tqdm
 
-# Discrete nperseg choices for the PSD search.  Spectra for each value are
-# precomputed once before Optuna starts; the search picks among them as a
-# Categorical parameter.
 PSD_NPERSEG_CHOICES: tuple[int, ...] = (128, 192, 256, 384, 512)
 
 app = typer.Typer(help="Hyperparameter search for FFT / PSD transport mode detectors.")
@@ -41,26 +32,59 @@ app = typer.Typer(help="Hyperparameter search for FFT / PSD transport mode detec
 # ---------------------------------------------------------------------------
 # Worker-process globals
 # ---------------------------------------------------------------------------
-# Each split's data must carry a "sample_id" column matching keys in the
-# spectra caches below.  The caches map sample_id → (freqs, spectrum).
-_optuna_train_data: pd.DataFrame | None = None
-_optuna_test_data: pd.DataFrame | None = None
-_optuna_all_splits: list | None = None
+_optuna_splits: list[tuple[pd.DataFrame, pd.DataFrame, np.ndarray, np.ndarray]] | None = None
 _optuna_metric: str = "mcc"
 
-# In-memory spectrum caches, populated in the main process and inherited by
-# fork()'d workers.  FFT cache: sample_id → (freqs, amplitude).  PSD cache:
-# (sample_id, nperseg) → (freqs, psd).
-_fft_spectra: dict[str, tuple[np.ndarray, np.ndarray]] | None = None
-_psd_spectra: dict[tuple[str, int], tuple[np.ndarray, np.ndarray]] | None = None
+_fft_spectra: "_Spectra | None" = None
+_psd_spectra: "dict[int, _Spectra] | None" = None
+_goertzel_chunks: np.ndarray | None = None
 
 
 # ---------------------------------------------------------------------------
-# Spectrum cache (DuckDB next to the .pkl) + parallel precomputation
+# Spectra container
 # ---------------------------------------------------------------------------
 
-_FFT_TABLE = "fft_spectra"
-_PSD_TABLE = "psd_spectra"
+class _Spectra:
+    """Spectra for a set of samples, padded into two dense matrices.
+
+    ``freqs`` and ``values`` are ``(n_samples, n_bins)`` float64 arrays; row *i*
+    holds sample *i*'s spectrum followed by padding — ``+inf`` in ``freqs`` and
+    ``0.0`` in ``values``.  Every band selection in the SNR kernels is an
+    interval test on ``freqs``, so padding bins fail all of them and never reach
+    a reduction.  That is what lets a trial evaluate whole blocks of samples
+    with a handful of numpy calls instead of one Python call per sample.
+    """
+
+    __slots__ = ("freqs", "values")
+
+    def __init__(self, freqs: np.ndarray, values: np.ndarray) -> None:
+        self.freqs = freqs
+        self.values = values
+
+    def __len__(self) -> int:
+        return int(self.freqs.shape[0])
+
+    @classmethod
+    def from_rows(cls, rows: list[tuple[np.ndarray, np.ndarray]]) -> "_Spectra":
+        """Build from a list of per-sample ``(freqs, values)`` pairs."""
+        n_bins = max((f.size for f, _ in rows), default=0)
+        freqs = np.full((len(rows), n_bins), np.inf, dtype=np.float64)
+        values = np.zeros((len(rows), n_bins), dtype=np.float64)
+        for i, (f, v) in enumerate(rows):
+            freqs[i, :f.size] = f
+            values[i, :v.size] = v
+        return cls(freqs, values)
+
+
+# ---------------------------------------------------------------------------
+# Spectrum cache (DuckDB next to the .pkl)
+# ---------------------------------------------------------------------------
+
+_FFT_TABLE = "fft_spectra_v2"
+_PSD_TABLE = "psd_spectra_v2"
+_LEGACY_TABLES = ("fft_spectra", "psd_spectra")
+
+_PRECOMPUTE_BLOCK = 128
 
 
 def _make_sample_id(row_id: str, chunk_data: pd.DataFrame) -> str:
@@ -71,16 +95,17 @@ def _make_sample_id(row_id: str, chunk_data: pd.DataFrame) -> str:
     the same id; an unrelated chunk almost certainly differs in at least one
     of these fields.
     """
-    ts = chunk_data["timestamp"].astype("int64").to_numpy()
+    ts = chunk_data["timestamp"].to_numpy()
+    ts = ts.view("int64") if ts.dtype.kind == "M" else ts.astype("int64")
     if ts.size == 0:
         return f"{row_id}#empty"
-    return f"{row_id}#{int(ts[0])}#{int(ts[-1])}#{int(ts.size)}"
+    return f"{row_id}#{ts[0]}#{ts[-1]}#{ts.size}"
 
 
 def _attach_sample_ids(data: pd.DataFrame) -> pd.DataFrame:
-    sample_ids = [
-        _make_sample_id(row.id, row.data) for row in data.itertuples(index=False)
-    ]
+    ids = data["id"].to_numpy()
+    chunks = data["data"].to_numpy()
+    sample_ids = [_make_sample_id(ids[i], chunks[i]) for i in range(len(data))]
     return data.assign(sample_id=sample_ids)
 
 
@@ -93,8 +118,8 @@ def _open_spectrum_cache(dataset_path: Path) -> tuple[duckdb.DuckDBPyConnection,
             detrend   BOOLEAN NOT NULL,
             "window"  BOOLEAN NOT NULL,
             fs        DOUBLE NOT NULL,
-            freqs     DOUBLE[] NOT NULL,
-            amplitude DOUBLE[] NOT NULL,
+            n_signal  INTEGER NOT NULL,
+            amplitude BLOB NOT NULL,
             PRIMARY KEY (sample_id, detrend, "window")
         )
     """)
@@ -103,15 +128,28 @@ def _open_spectrum_cache(dataset_path: Path) -> tuple[duckdb.DuckDBPyConnection,
             sample_id TEXT NOT NULL,
             nperseg   INTEGER NOT NULL,
             fs        DOUBLE NOT NULL,
-            freqs     DOUBLE[] NOT NULL,
-            psd       DOUBLE[] NOT NULL,
+            n_fft     INTEGER NOT NULL,
+            psd       BLOB NOT NULL,
             PRIMARY KEY (sample_id, nperseg)
         )
     """)
+    for legacy in _LEGACY_TABLES:
+        con.execute(f"DROP TABLE IF EXISTS {legacy}")
     n_fft = con.execute(f"SELECT COUNT(*) FROM {_FFT_TABLE}").fetchone()[0]
     n_psd = con.execute(f"SELECT COUNT(*) FROM {_PSD_TABLE}").fetchone()[0]
     typer.echo(f"  Spectrum cache: {cache_path}  (fft={n_fft:,}, psd={n_psd:,} entries)")
     return con, cache_path
+
+
+def _spectrum_from_row(fs: float, n_transform: int, blob: bytes) -> tuple[np.ndarray, np.ndarray]:
+    """Rebuild ``(freqs, values)`` from a cache row.
+
+    The frequency axis is not stored: it is fully determined by the sampling
+    rate and the transform length, and ``rfftfreq`` reproduces it exactly.
+    """
+    values = np.frombuffer(blob, dtype=np.float64)
+    freqs = np.fft.rfftfreq(int(n_transform), d=1 / float(fs))
+    return freqs, values
 
 
 def _get_cached_fft(
@@ -126,32 +164,29 @@ def _get_cached_fft(
     con.register("_qids", qdf)
     try:
         rows = con.execute(f"""
-            SELECT s.sample_id, s.freqs, s.amplitude
+            SELECT s.sample_id, s.fs, s.n_signal, s.amplitude
             FROM {_FFT_TABLE} s
             INNER JOIN _qids q ON s.sample_id = q.sample_id
             WHERE s.detrend = ? AND s."window" = ?
         """, [bool(detrend), bool(window)]).fetchall()
     finally:
         con.unregister("_qids")
-    return {
-        r[0]: (np.asarray(r[1], dtype=np.float64), np.asarray(r[2], dtype=np.float64))
-        for r in rows
-    }
+    return {r[0]: _spectrum_from_row(r[1], r[2], r[3]) for r in rows}
 
 
 def _insert_fft(
         con: duckdb.DuckDBPyConnection,
         rows: list[tuple],
 ) -> None:
-    """rows: list of (sample_id, detrend, window, fs, freqs_list, amplitude_list)."""
+    """rows: list of (sample_id, detrend, window, fs, n_signal, amplitude_bytes)."""
     if not rows:
         return
-    df = pd.DataFrame(rows, columns=["sample_id", "detrend", "window", "fs", "freqs", "amplitude"])
+    df = pd.DataFrame(rows, columns=["sample_id", "detrend", "window", "fs", "n_signal", "amplitude"])
     con.register("_ir", df)
     try:
         con.execute(f"""
             INSERT INTO {_FFT_TABLE}
-            SELECT sample_id, detrend, "window", fs, freqs, amplitude FROM _ir
+            SELECT sample_id, detrend, "window", fs, n_signal, amplitude FROM _ir
             ON CONFLICT DO NOTHING
         """)
     finally:
@@ -169,66 +204,84 @@ def _get_cached_psd(
     con.register("_qids", qdf)
     try:
         rows = con.execute(f"""
-            SELECT s.sample_id, s.freqs, s.psd
+            SELECT s.sample_id, s.fs, s.n_fft, s.psd
             FROM {_PSD_TABLE} s
             INNER JOIN _qids q ON s.sample_id = q.sample_id
             WHERE s.nperseg = ?
         """, [int(nperseg)]).fetchall()
     finally:
         con.unregister("_qids")
-    return {
-        r[0]: (np.asarray(r[1], dtype=np.float64), np.asarray(r[2], dtype=np.float64))
-        for r in rows
-    }
+    return {r[0]: _spectrum_from_row(r[1], r[2], r[3]) for r in rows}
 
 
 def _insert_psd(
         con: duckdb.DuckDBPyConnection,
         rows: list[tuple],
 ) -> None:
-    """rows: list of (sample_id, nperseg, fs, freqs_list, psd_list)."""
+    """rows: list of (sample_id, nperseg, fs, n_fft, psd_bytes)."""
     if not rows:
         return
-    df = pd.DataFrame(rows, columns=["sample_id", "nperseg", "fs", "freqs", "psd"])
+    df = pd.DataFrame(rows, columns=["sample_id", "nperseg", "fs", "n_fft", "psd"])
     con.register("_ir", df)
     try:
         con.execute(f"""
             INSERT INTO {_PSD_TABLE}
-            SELECT sample_id, nperseg, fs, freqs, psd FROM _ir
+            SELECT sample_id, nperseg, fs, n_fft, psd FROM _ir
             ON CONFLICT DO NOTHING
         """)
     finally:
         con.unregister("_ir")
 
 
-def _fft_spectrum_worker(args: tuple) -> tuple:
-    """Worker: compute one FFT spectrum.
+_precompute_chunks: np.ndarray | None = None
 
-    args: (sample_id, magnitude_arr, timestamp_arr_ns, detrend, window)
-    returns: (sample_id, detrend, window, fs, freqs_list, amplitude_list)
+
+def _fft_block_worker(args: tuple) -> tuple:
+    """Worker: compute the FFT spectra of one block of samples.
+
+    args: ((detrend, window), positions)
+    returns: ((detrend, window), [(position, fs, n_signal, amplitude_bytes), …])
     """
-    sample_id, mag, ts_ns, detrend, window = args
-    chunk = pd.DataFrame({
-        "magnitude": mag,
-        "timestamp": pd.to_datetime(ts_ns, unit="ns"),
-    })
-    freqs, amplitude, fs = compute_fft_spectrum(chunk, detrend=detrend, window=window)
-    return sample_id, bool(detrend), bool(window), float(fs), freqs.tolist(), amplitude.tolist()
+    key, positions = args
+    detrend, window = key
+    rows = []
+    for pos in positions:
+        chunk = _precompute_chunks[pos]
+        _, amplitude, fs = compute_fft_spectrum(chunk, detrend=detrend, window=window)
+        rows.append((int(pos), float(fs), int(len(chunk)), amplitude.tobytes()))
+    return key, rows
 
 
-def _psd_spectrum_worker(args: tuple) -> tuple:
-    """Worker: compute one PSD spectrum at a given nperseg.
+def _psd_block_worker(args: tuple) -> tuple:
+    """Worker: compute the Welch spectra of one block of samples.
 
-    args: (sample_id, magnitude_arr, timestamp_arr_ns, nperseg)
-    returns: (sample_id, nperseg, fs, freqs_list, psd_list)
+    args: (nperseg, positions)
+    returns: (nperseg, [(position, fs, n_fft, psd_bytes), …])
     """
-    sample_id, mag, ts_ns, nperseg = args
-    chunk = pd.DataFrame({
-        "magnitude": mag,
-        "timestamp": pd.to_datetime(ts_ns, unit="ns"),
-    })
-    freqs, psd, fs = compute_psd_spectrum(chunk, nperseg=int(nperseg))
-    return sample_id, int(nperseg), float(fs), freqs.tolist(), psd.tolist()
+    nperseg, positions = args
+    rows = []
+    for pos in positions:
+        chunk = _precompute_chunks[pos]
+        _, psd, fs = compute_psd_spectrum(chunk, nperseg=int(nperseg))
+        rows.append((int(pos), float(fs), min(int(nperseg), len(chunk)), psd.tobytes()))
+    return nperseg, rows
+
+
+def _blocks(key, positions: np.ndarray, size: int = _PRECOMPUTE_BLOCK) -> list[tuple]:
+    return [(key, positions[i:i + size]) for i in range(0, positions.size, size)]
+
+
+def _run_precompute(worker, args_list: list, *, n_jobs: int, total: int, initial: int, desc: str):
+    """Run *worker* over *args_list* in a fork()'d pool, yielding ``(key, rows)``."""
+    try:
+        mp_ctx = multiprocessing.get_context("fork")
+    except Exception:
+        mp_ctx = None
+    with ProcessPoolExecutor(max_workers=max(1, n_jobs), mp_context=mp_ctx) as pool:
+        with tqdm(total=total, initial=initial, desc=desc, leave=False) as pbar:
+            for key, rows in pool.map(worker, args_list):
+                pbar.update(len(rows))
+                yield key, rows
 
 
 def _precompute_fft_spectra(
@@ -238,48 +291,40 @@ def _precompute_fft_spectra(
         window: bool,
         n_jobs: int,
         con: duckdb.DuckDBPyConnection,
-        chunksize: int = 32,
-) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-    sample_ids = list(data["sample_id"].drop_duplicates())
-    cached = _get_cached_fft(con, sample_ids, detrend, window)
-    missing_ids = [sid for sid in sample_ids if sid not in cached]
+) -> _Spectra:
+    """Compute (or load) the FFT spectrum of every sample in *data*.
 
-    if missing_ids:
-        # Build per-id payload from the first occurrence of each sample_id
-        first_idx = data.drop_duplicates(subset="sample_id").set_index("sample_id")
-        args = []
-        for sid in missing_ids:
-            chunk = first_idx.at[sid, "data"]
-            mag = chunk["magnitude"].to_numpy(dtype=np.float64)
-            ts_ns = chunk["timestamp"].astype("int64").to_numpy()
-            args.append((sid, mag, ts_ns, bool(detrend), bool(window)))
+    *data* must already be deduplicated by "sample_id"; the returned _Spectra is
+    aligned to its row order.
+    """
+    global _precompute_chunks
 
+    sample_ids = data["sample_id"].to_numpy()
+    cached = _get_cached_fft(con, list(sample_ids), detrend, window)
+    rows: list = [cached.get(sid) for sid in sample_ids]
+    missing = np.flatnonzero([r is None for r in rows])
+
+    if missing.size:
+        _precompute_chunks = data["data"].to_numpy()
+        pending: list[tuple] = []
         try:
-            mp_ctx = multiprocessing.get_context("fork")
-        except Exception:
-            mp_ctx = None
+            for (det, win), block in _run_precompute(
+                    _fft_block_worker, _blocks((bool(detrend), bool(window)), missing),
+                    n_jobs=n_jobs, total=len(sample_ids), initial=len(cached),
+                    desc="  FFT spectra",
+            ):
+                for pos, fs, n_signal, blob in block:
+                    rows[pos] = _spectrum_from_row(fs, n_signal, blob)
+                    pending.append((sample_ids[pos], det, win, fs, n_signal, blob))
+                if len(pending) >= 4096:
+                    _insert_fft(con, pending)
+                    pending = []
+        finally:
+            _precompute_chunks = None
+        _insert_fft(con, pending)
+        con.execute("CHECKPOINT")
 
-        batch: list[tuple] = []
-        with ProcessPoolExecutor(max_workers=max(1, n_jobs), mp_context=mp_ctx) as pool:
-            with tqdm(total=len(sample_ids), initial=len(cached),
-                      desc="  FFT spectra", leave=False) as pbar:
-                for result in pool.map(_fft_spectrum_worker, args, chunksize=chunksize):
-                    sid, det, win, fs, freqs_list, amp_list = result
-                    cached[sid] = (
-                        np.asarray(freqs_list, dtype=np.float64),
-                        np.asarray(amp_list, dtype=np.float64),
-                    )
-                    batch.append(result)
-                    pbar.update(1)
-                    if len(batch) >= 256:
-                        _insert_fft(con, batch)
-                        con.execute("CHECKPOINT")
-                        batch.clear()
-        if batch:
-            _insert_fft(con, batch)
-            con.execute("CHECKPOINT")
-
-    return cached
+    return _Spectra.from_rows(rows)
 
 
 def _precompute_psd_spectra(
@@ -288,52 +333,46 @@ def _precompute_psd_spectra(
         nperseg_values: tuple[int, ...],
         n_jobs: int,
         con: duckdb.DuckDBPyConnection,
-        chunksize: int = 32,
-) -> dict[tuple[str, int], tuple[np.ndarray, np.ndarray]]:
-    sample_ids = list(data["sample_id"].drop_duplicates())
-    first_idx = data.drop_duplicates(subset="sample_id").set_index("sample_id")
+) -> dict[int, _Spectra]:
+    """Compute (or load) the Welch spectra of every sample in *data*.
 
-    out: dict[tuple[str, int], tuple[np.ndarray, np.ndarray]] = {}
-    args: list[tuple] = []
+    *data* must already be deduplicated by "sample_id"; every returned _Spectra
+    is aligned to its row order.
+    """
+    global _precompute_chunks
+
+    sample_ids = data["sample_id"].to_numpy()
+    total = len(sample_ids) * len(nperseg_values)
+    per_nperseg: dict[int, list] = {}
+    args_list: list[tuple] = []
+    n_cached = 0
     for nperseg in nperseg_values:
-        cached_n = _get_cached_psd(con, sample_ids, nperseg)
-        for sid in sample_ids:
-            if sid in cached_n:
-                out[(sid, int(nperseg))] = cached_n[sid]
-            else:
-                chunk = first_idx.at[sid, "data"]
-                mag = chunk["magnitude"].to_numpy(dtype=np.float64)
-                ts_ns = chunk["timestamp"].astype("int64").to_numpy()
-                args.append((sid, mag, ts_ns, int(nperseg)))
+        cached = _get_cached_psd(con, list(sample_ids), nperseg)
+        rows = [cached.get(sid) for sid in sample_ids]
+        per_nperseg[int(nperseg)] = rows
+        n_cached += len(cached)
+        args_list += _blocks(int(nperseg), np.flatnonzero([r is None for r in rows]))
 
-    if args:
+    if args_list:
+        _precompute_chunks = data["data"].to_numpy()
+        pending: list[tuple] = []
         try:
-            mp_ctx = multiprocessing.get_context("fork")
-        except Exception:
-            mp_ctx = None
+            for nperseg, block in _run_precompute(
+                    _psd_block_worker, args_list, n_jobs=n_jobs,
+                    total=total, initial=n_cached, desc="  PSD spectra",
+            ):
+                for pos, fs, n_fft, blob in block:
+                    per_nperseg[nperseg][pos] = _spectrum_from_row(fs, n_fft, blob)
+                    pending.append((sample_ids[pos], nperseg, fs, n_fft, blob))
+                if len(pending) >= 4096:
+                    _insert_psd(con, pending)
+                    pending = []
+        finally:
+            _precompute_chunks = None
+        _insert_psd(con, pending)
+        con.execute("CHECKPOINT")
 
-        total = len(sample_ids) * len(nperseg_values)
-        batch: list[tuple] = []
-        with ProcessPoolExecutor(max_workers=max(1, n_jobs), mp_context=mp_ctx) as pool:
-            with tqdm(total=total, initial=total - len(args),
-                      desc="  PSD spectra", leave=False) as pbar:
-                for result in pool.map(_psd_spectrum_worker, args, chunksize=chunksize):
-                    sid, nperseg, fs, freqs_list, psd_list = result
-                    out[(sid, int(nperseg))] = (
-                        np.asarray(freqs_list, dtype=np.float64),
-                        np.asarray(psd_list, dtype=np.float64),
-                    )
-                    batch.append(result)
-                    pbar.update(1)
-                    if len(batch) >= 256:
-                        _insert_psd(con, batch)
-                        con.execute("CHECKPOINT")
-                        batch.clear()
-        if batch:
-            _insert_psd(con, batch)
-            con.execute("CHECKPOINT")
-
-    return out
+    return {n: _Spectra.from_rows(rows) for n, rows in per_nperseg.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -341,17 +380,28 @@ def _precompute_psd_spectra(
 # ---------------------------------------------------------------------------
 
 def _compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
-    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[False, True]).ravel()
+    """Binary classification metrics, derived from the confusion matrix."""
+    tn, fp, fn, tp = (int(v) for v in confusion_matrix(y_true, y_pred, labels=[False, True]).ravel())
+    n = tn + fp + fn + tp
+    counts = np.array([[tn, fp], [fn, tp]], dtype=np.float64)
+    true_sum = counts.sum(axis=1)
+    pred_sum = counts.sum(axis=0)
+    n_correct = np.trace(counts)
+    n_samples = pred_sum.sum()
+    cov_ytyp = n_correct * n_samples - true_sum @ pred_sum
+    cov_ypyp = n_samples ** 2 - pred_sum @ pred_sum
+    cov_ytyt = n_samples ** 2 - true_sum @ true_sum
+    f1_denom = (tp + fn) + (tp + fp)
     return {
-        "TP": int(tp),
-        "FP": int(fp),
-        "TN": int(tn),
-        "FN": int(fn),
-        "accuracy": float(accuracy_score(y_true, y_pred)),
-        "precision": float(precision_score(y_true, y_pred, zero_division=0)),
-        "recall": float(recall_score(y_true, y_pred, zero_division=0)),
-        "f1": float(f1_score(y_true, y_pred, zero_division=0)),
-        "mcc": float(matthews_corrcoef(y_true, y_pred)),
+        "TP": tp,
+        "FP": fp,
+        "TN": tn,
+        "FN": fn,
+        "accuracy": (tp + tn) / n,
+        "precision": tp / (tp + fp) if tp + fp else 0.0,
+        "recall": tp / (tp + fn) if tp + fn else 0.0,
+        "f1": (2.0 * tp) / f1_denom if f1_denom else 0.0,
+        "mcc": 0.0 if cov_ypyp * cov_ytyt == 0 else float(cov_ytyp / np.sqrt(cov_ytyt * cov_ypyp)),
         "samples": int(len(y_true)),
         "samples_trainride": int(y_true.sum()),
         "samples_no_trainride": int(len(y_true) - y_true.sum()),
@@ -364,8 +414,13 @@ def _apply_sliding_window(
         length: int,
         threshold: float,
 ) -> pd.Series:
+    """Majority-vote *predicted* within a centred window, per recording id."""
     if length <= 1:
         return predicted
+    try:
+        return _sliding_window_vote(data, predicted, length, threshold)
+    except Exception:
+        pass
     try:
         return (
             data.assign(_pred=predicted)
@@ -383,50 +438,149 @@ def _apply_sliding_window(
         return predicted
 
 
-# ---------------------------------------------------------------------------
-# SNR computation helpers (read from precomputed spectrum caches)
-# ---------------------------------------------------------------------------
-
-def _snr_from_cached_fft(
+def _sliding_window_vote(
         data: pd.DataFrame,
-        *,
-        signal_delta: float,
-        spectrum_min_freq: float,
-        spectrum_max_freq: float,
-        harmonics_mask: bool,
-        noise_model: str,
-        guard_band: float,
-        noise_band: float,
-        target_frequency: float,
-) -> np.ndarray:
-    """Per-sample FFT SNR using ``_fft_spectra``; NaN for missing/failing samples."""
-    out = np.empty(len(data), dtype=np.float64)
-    cache = _fft_spectra
-    sids = data["sample_id"].to_numpy()
-    for i, sid in enumerate(sids):
-        spec = cache.get(sid) if cache is not None else None
-        if spec is None:
-            out[i] = np.nan
-            continue
-        freqs, amplitude = spec
-        out[i] = compute_snr_from_spectrum(
-            freqs, amplitude,
-            target_freq=target_frequency,
-            signal_delta=signal_delta,
-            spectrum_min_freq=spectrum_min_freq,
-            spectrum_max_freq=spectrum_max_freq,
-            harmonics_mask=harmonics_mask,
-            noise_model=noise_model,
-            guard_band=guard_band,
-            noise_band=noise_band,
-            min_noise_bins=4,
-        )
+        predicted: pd.Series,
+        length: int,
+        threshold: float,
+) -> pd.Series:
+    """Vectorised equivalent of the per-group rolling majority vote.
+
+    Computes the same per-group ``rolling(center=True, min_periods=1).mean()``
+    from one grouped prefix sum, instead of building a rolling object per
+    recording.  Window sums are small integers, so summing them a different way
+    cannot change a single bit of the resulting means.
+    """
+    ids = data["id"].to_numpy()
+    values = predicted.to_numpy().astype(np.int64)
+    n = values.size
+
+    codes = pd.factorize(ids)[0]
+    if (codes < 0).any():
+        raise ValueError("cannot group rows with a null id")
+
+    order = np.argsort(codes, kind="stable")
+    sizes = np.bincount(codes)
+    starts = np.concatenate(([0], np.cumsum(sizes)))
+    base = np.repeat(starts[:-1], sizes)
+    within = np.arange(n) - base
+    group_size = np.repeat(sizes, sizes)
+
+    prefix = np.concatenate(([0], np.cumsum(values[order])))
+    lo = base + np.maximum(within - length // 2, 0)
+    hi = base + np.minimum(within + (length - 1) // 2 + 1, group_size)
+
+    voted = (prefix[hi] - prefix[lo]) / (hi - lo) >= threshold
+    out = np.empty(n, dtype=bool)
+    out[order] = voted
+    return pd.Series(out, index=data.index)
+
+
+# ---------------------------------------------------------------------------
+# SNR computation over precomputed spectra
+# ---------------------------------------------------------------------------
+_SNR_BLOCK = 4096
+
+
+def _masked_reduce(matrix: np.ndarray, mask: np.ndarray, reducer) -> np.ndarray:
+    """Row-wise ``reducer(matrix[i][mask[i]])`` for every row of *matrix*.
+
+    Rows are grouped by how many entries they select; each group is gathered
+    into a dense ``(rows, k)`` array and reduced along axis 1 with a single
+    numpy call.  A gathered row is a contiguous copy of exactly the values the
+    per-row expression would select, in the same order, so ``np.mean`` sums them
+    in the same pairwise order and ``np.median`` picks the same order statistics
+    — the result is identical to the row-at-a-time version, not merely close.
+    Rows selecting nothing keep NaN, which every caller treats as a failure.
+    """
+    out = np.full(matrix.shape[0], np.nan, dtype=np.float64)
+    rows, cols = np.nonzero(mask)
+    if rows.size == 0:
+        return out
+    counts = np.bincount(rows, minlength=matrix.shape[0])
+    offsets = np.concatenate(([0], np.cumsum(counts)))
+    for k in np.unique(counts[counts > 0]):
+        selected = np.flatnonzero(counts == k)
+        taken = cols[offsets[selected][:, None] + np.arange(k)]
+        out[selected] = reducer(matrix[selected[:, None], taken], axis=1)
     return out
 
 
-def _snr_from_cached_psd(
-        data: pd.DataFrame,
+def _noise_floor_block(
+        freqs: np.ndarray,
+        values: np.ndarray,
+        noise: np.ndarray,
+        usable: np.ndarray,
         *,
+        target_freq: float,
+        noise_model: str,
+        guard_band: float,
+        noise_band: float,
+) -> np.ndarray:
+    """Per-row noise floor at *target_freq*; NaN where it cannot be estimated."""
+    if noise_model == "median":
+        return _masked_reduce(values, noise & usable[:, None], np.median)
+
+    if noise_model == "interpolate":
+        window = noise & usable[:, None]
+        lo = window & (freqs >= target_freq - guard_band - noise_band) & (freqs < target_freq - guard_band)
+        hi = window & (freqs > target_freq + guard_band) & (freqs <= target_freq + guard_band + noise_band)
+        f_lo = _masked_reduce(freqs, lo, np.mean)
+        f_hi = _masked_reduce(freqs, hi, np.mean)
+        s_lo = _masked_reduce(values, lo, np.median)
+        s_hi = _masked_reduce(values, hi, np.median)
+        with np.errstate(all="ignore"):
+            log_f_lo = np.log(f_lo)
+            log_s_lo = np.log(s_lo)
+            slope = (np.log(s_hi) - log_s_lo) / (np.log(f_hi) - log_f_lo)
+            floor = np.exp(log_s_lo + slope * (np.log(target_freq) - log_f_lo))
+            floor[~((s_lo > 0) & (s_hi > 0) & (f_lo > 0) & (f_hi > 0))] = np.nan
+        return floor
+
+    if noise_model == "spline":
+        return _spline_noise_floor(freqs, values, noise, usable, target_freq)
+
+    raise ValueError(
+        f"Unknown noise_model '{noise_model}'. Choose from 'median', 'interpolate', 'spline'."
+    )
+
+
+def _spline_noise_floor(
+        freqs: np.ndarray,
+        values: np.ndarray,
+        noise: np.ndarray,
+        usable: np.ndarray,
+        target_freq: float,
+) -> np.ndarray:
+    """Smoothing-spline noise floor, fitted one row at a time.
+
+    FITPACK fits a spline to a single curve, so unlike the other noise models
+    this one has no batched form.  Selecting the bins to fit and counting them
+    still happens for the whole block at once; only the fit itself is per row.
+    """
+    out = np.full(freqs.shape[0], np.nan, dtype=np.float64)
+    fit_bins = noise & (values > 0) & (freqs > 0)
+    n_bins = fit_bins.sum(axis=1)
+    log_target = np.log(target_freq)
+    for i in np.flatnonzero(usable & (n_bins >= 4)):
+        row = fit_bins[i]
+        try:
+            spline = UnivariateSpline(
+                np.log(freqs[i][row]), np.log(values[i][row]), k=3, s=int(n_bins[i]),
+            )
+            floor = float(np.exp(float(spline(log_target))))
+        except Exception:
+            continue
+        if floor > 0:
+            out[i] = floor
+    return out
+
+
+def _snr_block(
+        freqs: np.ndarray,
+        values: np.ndarray,
+        *,
+        target_frequency: float,
         signal_delta: float,
         spectrum_min_freq: float,
         spectrum_max_freq: float,
@@ -434,31 +588,42 @@ def _snr_from_cached_psd(
         noise_model: str,
         guard_band: float,
         noise_band: float,
-        nperseg: int,
-        target_frequency: float,
+        min_noise_bins: int,
 ) -> np.ndarray:
-    """Per-sample Welch SNR using ``_psd_spectra``; NaN for missing/failing samples."""
-    out = np.empty(len(data), dtype=np.float64)
-    cache = _psd_spectra
-    nperseg_int = int(nperseg)
-    sids = data["sample_id"].to_numpy()
-    for i, sid in enumerate(sids):
-        spec = cache.get((sid, nperseg_int)) if cache is not None else None
-        if spec is None:
-            out[i] = np.nan
-            continue
-        freqs, psd = spec
-        out[i] = compute_snr_from_spectrum(
-            freqs, psd,
-            target_freq=target_frequency,
-            signal_delta=signal_delta,
-            spectrum_min_freq=spectrum_min_freq,
-            spectrum_max_freq=spectrum_max_freq,
-            harmonics_mask=harmonics_mask,
-            noise_model=noise_model,
-            guard_band=guard_band,
-            noise_band=noise_band,
-            min_noise_bins=5,
+    """Peak-to-noise-floor SNR for a block of spectra; NaN where undefined."""
+    in_band = (freqs >= spectrum_min_freq) & (freqs <= spectrum_max_freq)
+    off_target = np.abs(freqs - target_frequency) > signal_delta
+    target = in_band & ~off_target
+    noise = in_band & off_target
+    if harmonics_mask:
+        for harmonic in range(2, 4):
+            noise &= np.abs(freqs - target_frequency * harmonic) > signal_delta
+
+    out = np.full(freqs.shape[0], np.nan, dtype=np.float64)
+    usable = target.any(axis=1) & (noise.sum(axis=1) >= min_noise_bins)
+    if not usable.any():
+        return out
+
+    floor = _noise_floor_block(
+        freqs, values, noise, usable,
+        target_freq=target_frequency, noise_model=noise_model,
+        guard_band=guard_band, noise_band=noise_band,
+    )
+    estimated = usable & (floor > 0)
+    peak = np.max(values, axis=1, where=target, initial=-np.inf)
+    out[estimated] = peak[estimated] / floor[estimated]
+    return out
+
+
+def _snr_from_spectra(spectra: "_Spectra", *, min_noise_bins: int, **params) -> np.ndarray:
+    """Per-sample SNR for every spectrum in *spectra*, evaluated in blocks."""
+    n = len(spectra)
+    out = np.empty(n, dtype=np.float64)
+    for start in range(0, n, _SNR_BLOCK):
+        stop = min(start + _SNR_BLOCK, n)
+        out[start:stop] = _snr_block(
+            spectra.freqs[start:stop], spectra.values[start:stop],
+            min_noise_bins=min_noise_bins, **params,
         )
     return out
 
@@ -479,140 +644,88 @@ def _evaluate_with_snr(
 
 
 # ---------------------------------------------------------------------------
-# FFT trial runner
+# Per-method SNR: one value per sample, for the whole dataset
 # ---------------------------------------------------------------------------
 
-def _run_trial_fft(params: dict) -> Tuple[float, dict, dict]:
-    snr_kwargs = {k: params[k] for k in (
-        "signal_delta", "spectrum_min_freq", "spectrum_max_freq",
-        "harmonics_mask", "noise_model", "guard_band", "noise_band",
-        "target_frequency",
-    )}
-    sw_len = params["sliding_window_length"]
-    sw_thr = params["sliding_window_threshold"]
-
-    snr_train = _snr_from_cached_fft(_optuna_train_data, **snr_kwargs)
-    snr_test = _snr_from_cached_fft(_optuna_test_data, **snr_kwargs)
-
-    best_thr, _ = find_best_threshold_snr(
-        snr_train,
-        _optuna_train_data["trainride"].to_numpy().astype(bool),
-        metric=_optuna_metric,
+def _snr_all_fft(params: dict) -> np.ndarray:
+    return _snr_from_spectra(
+        _fft_spectra,
+        min_noise_bins=4,
+        **{k: params[k] for k in (
+            "signal_delta", "spectrum_min_freq", "spectrum_max_freq",
+            "harmonics_mask", "noise_model", "guard_band", "noise_band",
+            "target_frequency",
+        )},
     )
 
-    stats_train = _evaluate_with_snr(_optuna_train_data, snr_train, best_thr, sw_len, sw_thr)
-    stats_test = _evaluate_with_snr(_optuna_test_data, snr_test, best_thr, sw_len, sw_thr)
-    stats_train["snr_threshold"] = float(best_thr)
-    return stats_test["f1"], stats_test, stats_train
 
-
-# ---------------------------------------------------------------------------
-# PSD trial runner
-# ---------------------------------------------------------------------------
-
-def _run_trial_psd(params: dict) -> Tuple[float, dict, dict]:
-    snr_kwargs = {k: params[k] for k in (
-        "signal_delta", "spectrum_min_freq", "spectrum_max_freq",
-        "harmonics_mask", "noise_model", "guard_band", "noise_band",
-        "nperseg", "target_frequency",
-    )}
-    sw_len = params["sliding_window_length"]
-    sw_thr = params["sliding_window_threshold"]
-
-    snr_train = _snr_from_cached_psd(_optuna_train_data, **snr_kwargs)
-    snr_test = _snr_from_cached_psd(_optuna_test_data, **snr_kwargs)
-
-    best_thr, _ = find_best_threshold_snr(
-        snr_train,
-        _optuna_train_data["trainride"].to_numpy().astype(bool),
-        metric=_optuna_metric,
+def _snr_all_psd(params: dict) -> np.ndarray:
+    return _snr_from_spectra(
+        _psd_spectra[int(params["nperseg"])],
+        min_noise_bins=5,
+        **{k: params[k] for k in (
+            "signal_delta", "spectrum_min_freq", "spectrum_max_freq",
+            "harmonics_mask", "noise_model", "guard_band", "noise_band",
+            "target_frequency",
+        )},
     )
 
-    stats_train = _evaluate_with_snr(_optuna_train_data, snr_train, best_thr, sw_len, sw_thr)
-    stats_test = _evaluate_with_snr(_optuna_test_data, snr_test, best_thr, sw_len, sw_thr)
-    stats_train["snr_threshold"] = float(best_thr)
-    return stats_test["f1"], stats_test, stats_train
 
-
-# ---------------------------------------------------------------------------
-# Goertzel trial runner (no precompute / cache — recomputed per trial)
-# ---------------------------------------------------------------------------
-
-def _snr_goertzel(
-        data: pd.DataFrame,
-        *,
-        target_frequency: float,
-        spectrum_min_freq: float,
-        spectrum_max_freq: float,
-        guard_band: float,
-        noise_n_probes: int,
-        probe_split: float,
-        noise_model: str,
-) -> np.ndarray:
-    """Per-sample Goertzel SNR.  Dedupes work across rows that share a sample_id."""
-    out = np.empty(len(data), dtype=np.float64)
-    cache: dict[str, float] = {}
-    sids = data["sample_id"].to_numpy()
-    chunks = data["data"].to_numpy()
-    for i in range(len(data)):
-        sid = sids[i]
-        if sid in cache:
-            out[i] = cache[sid]
-            continue
-        v = compute_snr_goertzel(
+def _snr_all_goertzel(params: dict) -> np.ndarray:
+    """Per-sample Goertzel SNR.  No precompute — recomputed per trial."""
+    chunks = _goertzel_chunks
+    out = np.empty(len(chunks), dtype=np.float64)
+    for i in range(len(chunks)):
+        out[i] = compute_snr_goertzel(
             chunks[i],
-            target_freq=float(target_frequency),
-            spectrum_min_freq=float(spectrum_min_freq),
-            spectrum_max_freq=float(spectrum_max_freq),
-            guard_band=float(guard_band),
-            noise_n_probes=int(noise_n_probes),
-            probe_split=float(probe_split),
-            noise_model=str(noise_model),
+            target_freq=float(params["target_frequency"]),
+            spectrum_min_freq=float(params["spectrum_min_freq"]),
+            spectrum_max_freq=float(params["spectrum_max_freq"]),
+            guard_band=float(params["guard_band"]),
+            noise_n_probes=int(params["noise_n_probes"]),
+            probe_split=float(params["probe_split"]),
+            noise_model=str(params["noise_model"]),
         )
-        cache[sid] = v
-        out[i] = v
     return out
 
 
-def _run_trial_goertzel(params: dict) -> Tuple[float, dict, dict]:
-    snr_kwargs = {k: params[k] for k in (
-        "target_frequency", "spectrum_min_freq", "spectrum_max_freq",
-        "guard_band", "noise_n_probes", "probe_split", "noise_model",
-    )}
+# ---------------------------------------------------------------------------
+# Trial runner
+# ---------------------------------------------------------------------------
+
+def _run_trial(snr_fn, params: dict) -> Tuple[float, dict, dict]:
+    """Score one parameter set over every evaluation run.
+
+    A sample's SNR depends only on the sample and the trial parameters — not on
+    which split it happens to be in — so it is computed once for the whole
+    dataset and then indexed per run, instead of being recomputed for every
+    train and test split of every run.
+    """
+    snr_all = snr_fn(params)
     sw_len = params["sliding_window_length"]
     sw_thr = params["sliding_window_threshold"]
-
-    snr_train = _snr_goertzel(_optuna_train_data, **snr_kwargs)
-    snr_test = _snr_goertzel(_optuna_test_data, **snr_kwargs)
-
-    best_thr, _ = find_best_threshold_snr(
-        snr_train,
-        _optuna_train_data["trainride"].to_numpy().astype(bool),
-        metric=_optuna_metric,
-    )
-
-    stats_train = _evaluate_with_snr(_optuna_train_data, snr_train, best_thr, sw_len, sw_thr)
-    stats_test = _evaluate_with_snr(_optuna_test_data, snr_test, best_thr, sw_len, sw_thr)
-    stats_train["snr_threshold"] = float(best_thr)
-    return stats_test["f1"], stats_test, stats_train
-
-
-# ---------------------------------------------------------------------------
-# Multi-run aggregation
-# ---------------------------------------------------------------------------
-
-def _run_trial_multi_runs(run_fn, params: dict) -> Tuple[float, dict, dict]:
-    global _optuna_train_data, _optuna_test_data, _optuna_all_splits
 
     all_stats_test: list[dict] = []
     all_stats_train: list[dict] = []
 
-    for train_d, test_d in _optuna_all_splits:
-        _optuna_train_data = train_d
-        _optuna_test_data = test_d
-        _, stats_test, stats_train = run_fn(params)
+    for train_data, test_data, train_pos, test_pos in _optuna_splits:
+        snr_train = snr_all[train_pos]
+        snr_test = snr_all[test_pos]
+
+        best_thr, _ = find_best_threshold_snr(
+            snr_train,
+            train_data["trainride"].to_numpy().astype(bool),
+            metric=_optuna_metric,
+        )
+
+        stats_train = _evaluate_with_snr(train_data, snr_train, best_thr, sw_len, sw_thr)
+        stats_test = _evaluate_with_snr(test_data, snr_test, best_thr, sw_len, sw_thr)
+        stats_train["snr_threshold"] = float(best_thr)
         all_stats_test.append(stats_test)
         all_stats_train.append(stats_train)
+
+    if len(all_stats_test) == 1:
+        return all_stats_test[0]["f1"], all_stats_test[0], all_stats_train[0]
 
     def _aggregate(all_stats: list[dict]) -> dict:
         agg: dict = {}
@@ -659,6 +772,82 @@ def _print_dataset_stats(data: pd.DataFrame, label: str) -> None:
     n_neg = total - n_pos
     n_ids = data["id"].nunique()
     typer.echo(f"  {label}: {total} samples ({n_pos} trainride / {n_neg} no-trainride), {n_ids} unique IDs")
+
+
+def _prepare_evaluation(
+        *,
+        dataset_path: Path,
+        n_jobs: int,
+        precompute_fn,
+        runs: int,
+        test_frac: float,
+        seed_int: int,
+        metric: str,
+        verbose: bool = True,
+) -> pd.DataFrame:
+    """Load a dataset, precompute its spectra and publish the evaluation splits.
+
+    Shared by the Optuna search and by the ``fast-evaluation tmd`` CLI so that
+    scoring a parameter set uses exactly the same code path in both: the splits,
+    the spectra and the metric all land in the module globals that
+    :func:`_run_trial` reads.  Returns the dataset metadata frame.
+    """
+    if verbose:
+        typer.echo("  Loading dataset …")
+    full_data = read_pickle(dataset_path)
+    full_data = _attach_sample_ids(full_data)
+    dataset_meta = get_metadata_from_dataset(dataset_path)
+
+    if verbose:
+        typer.echo("  Dataset class distribution:")
+        _print_dataset_stats(full_data, "Full dataset")
+
+    unique_samples = full_data.drop_duplicates(subset="sample_id")
+    sample_position = pd.Series(
+        np.arange(len(unique_samples), dtype=np.int64),
+        index=unique_samples["sample_id"].to_numpy(),
+    )
+
+    fft_spec = None
+    psd_spec = None
+    chunks = None
+    if precompute_fn is not None:
+        con, _ = _open_spectrum_cache(dataset_path)
+        try:
+            fft_spec, psd_spec = precompute_fn(unique_samples, n_jobs, con)
+        finally:
+            con.close()
+    else:
+        chunks = unique_samples["data"].to_numpy()
+    del unique_samples
+    full_data = full_data.drop(columns="data")
+
+    if runs > 1:
+        split_seeds = [seed_int + i for i in range(runs)]
+        splits = [train_test_split(full_data, test_frac=test_frac, random_state=s, split_column='id') for s in
+                  split_seeds]
+        if verbose:
+            typer.echo(f"  Multi-run mode: {runs} runs with different train/test splits")
+            for i, (tr, te) in enumerate(splits, start=1):
+                _print_dataset_stats(tr, f"Train set (run {i}/{runs})")
+                _print_dataset_stats(te, f"Test set  (run {i}/{runs})")
+    else:
+        splits = [train_test_split(full_data, test_frac=test_frac, random_state=seed_int, split_column='id')]
+        if verbose:
+            _print_dataset_stats(splits[0][0], "Train set")
+            _print_dataset_stats(splits[0][1], "Test set")
+
+    def _positions(split: pd.DataFrame) -> np.ndarray:
+        return sample_position.loc[split["sample_id"].to_numpy()].to_numpy()
+
+    global _optuna_splits, _fft_spectra, _psd_spectra, _goertzel_chunks, _optuna_metric
+    _optuna_splits = [(tr, te, _positions(tr), _positions(te)) for tr, te in splits]
+    _fft_spectra = fft_spec
+    _psd_spectra = psd_spec
+    _goertzel_chunks = chunks
+    _optuna_metric = metric
+
+    return dataset_meta
 
 
 def _optuna_search_common(
@@ -714,53 +903,15 @@ def _optuna_search_common(
     typer.echo(f"  Results CSV:    {results_csv_path}")
     typer.echo(f"  Optuna storage: {storage}")
 
-    typer.echo("  Loading dataset …")
-    full_data = read_pickle(dataset_path)
-    full_data = _attach_sample_ids(full_data)
-    dataset_meta = get_metadata_from_dataset(dataset_path)
-
-    typer.echo("  Dataset class distribution:")
-    _print_dataset_stats(full_data, "Full dataset")
-
-    # Precompute spectra (cached in DuckDB next to the dataset).  The resulting
-    # dicts live in module globals so fork()'d Optuna workers inherit them via
-    # copy-on-write — no per-trial recomputation, no pickling.
-    fft_spec: dict | None = None
-    psd_spec: dict | None = None
-    if precompute_fn is not None:
-        con, _ = _open_spectrum_cache(dataset_path)
-        try:
-            fft_spec, psd_spec = precompute_fn(full_data, n_jobs, con)
-        finally:
-            con.close()
-
-    if multi_run:
-        split_seeds = [seed_int + i for i in range(runs)]
-        splits = [train_test_split(full_data, test_frac=test_frac, random_state=s, split_column='id') for s in split_seeds]
-        typer.echo(f"  Multi-run mode: {runs} runs with different train/test splits")
-
-        for i, (tr, te) in enumerate(splits, start=1):
-            _print_dataset_stats(tr, f"Train set (run {i}/{runs})")
-            _print_dataset_stats(te, f"Test set  (run {i}/{runs})")
-
-        train_data, test_data = splits[0]
-    else:
-        splits = None
-        train_data, test_data = train_test_split(full_data, test_frac=test_frac, random_state=seed_int, split_column='id')
-
-        _print_dataset_stats(train_data, "Train set")
-        _print_dataset_stats(test_data, "Test set")
-
-    # Set module globals so fork()'d workers inherit data + spectrum caches
-    # without paying the pickling cost of initargs.
-    global _optuna_train_data, _optuna_test_data, _optuna_all_splits
-    global _fft_spectra, _psd_spectra, _optuna_metric
-    _optuna_train_data = train_data
-    _optuna_test_data = test_data
-    _optuna_all_splits = splits
-    _fft_spectra = fft_spec
-    _psd_spectra = psd_spec
-    _optuna_metric = metric
+    dataset_meta = _prepare_evaluation(
+        dataset_path=dataset_path,
+        n_jobs=n_jobs,
+        precompute_fn=precompute_fn,
+        runs=runs,
+        test_frac=test_frac,
+        seed_int=seed_int,
+        metric=metric,
+    )
 
     std_cols = (
             ["n_runs"]
@@ -849,10 +1000,7 @@ def _optuna_search_common(
             futures = {}
             for t, cond_params in batch_trials:
                 payload = {**t.params, **cond_params, **fixed_params}
-                if multi_run:
-                    futures[pool.submit(_run_trial_multi_runs, run_trial_fn, payload)] = (t, cond_params)
-                else:
-                    futures[pool.submit(run_trial_fn, payload)] = (t, cond_params)
+                futures[pool.submit(_run_trial, run_trial_fn, payload)] = (t, cond_params)
 
             for fut in as_completed(futures):
                 t, cond_params = futures[fut]
@@ -939,7 +1087,8 @@ def _optuna_search_common(
                 trial_counter += 1
 
                 try:
-                    pd.DataFrame([row], columns=csv_header).to_csv(results_csv_path, index=False, mode="a", header=False)
+                    pd.DataFrame([row], columns=csv_header).to_csv(results_csv_path, index=False, mode="a",
+                                                                   header=False)
                 except Exception as e:
                     typer.echo(f"\n  Failed to save trial result: {e}", err=True)
 
@@ -1098,7 +1247,7 @@ def optuna_search_fft(
         storage=storage,
         distributions=dist,
         fixed_params=fixed_params,
-        run_trial_fn=_run_trial_fft,
+        run_trial_fn=_snr_all_fft,
         label="fft",
         test_frac=test_frac,
         seed=seed,
@@ -1214,7 +1363,7 @@ def optuna_search_psd(
         storage=storage,
         distributions=dist,
         fixed_params=fixed_params,
-        run_trial_fn=_run_trial_psd,
+        run_trial_fn=_snr_all_psd,
         label="psd",
         test_frac=test_frac,
         seed=seed,
@@ -1245,7 +1394,8 @@ def preprocess_fft(
     con, _ = _open_spectrum_cache(dataset_path)
     try:
         _precompute_fft_spectra(
-            full_data, detrend=True, window=True, n_jobs=int(n_jobs or 1), con=con,
+            full_data.drop_duplicates(subset="sample_id"),
+            detrend=True, window=True, n_jobs=int(n_jobs or 1), con=con,
         )
     finally:
         con.close()
@@ -1271,7 +1421,8 @@ def preprocess_psd(
     con, _ = _open_spectrum_cache(dataset_path)
     try:
         _precompute_psd_spectra(
-            full_data, nperseg_values=PSD_NPERSEG_CHOICES, n_jobs=int(n_jobs or 1), con=con,
+            full_data.drop_duplicates(subset="sample_id"),
+            nperseg_values=PSD_NPERSEG_CHOICES, n_jobs=int(n_jobs or 1), con=con,
         )
     finally:
         con.close()
@@ -1354,7 +1505,8 @@ def goertzel_single(
 
     if multi_run:
         split_seeds = [seed_int + i for i in range(runs)]
-        splits = [train_test_split(full_data, test_frac=test_frac, random_state=s, split_column='id') for s in split_seeds]
+        splits = [train_test_split(full_data, test_frac=test_frac, random_state=s, split_column='id') for s in
+                  split_seeds]
         typer.echo(f"  Multi-run mode: {runs} runs with different train/test splits")
         for i, (tr, te) in enumerate(splits, start=1):
             _print_dataset_stats(tr, f"Train set (run {i}/{runs})")
@@ -1562,7 +1714,7 @@ def optuna_search_goertzel(
         storage=storage,
         distributions=dist,
         fixed_params=fixed_params,
-        run_trial_fn=_run_trial_goertzel,
+        run_trial_fn=_snr_all_goertzel,
         label="goertzel",
         test_frac=test_frac,
         seed=seed,

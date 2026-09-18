@@ -79,6 +79,8 @@ _TABLE_EUCLIDEAN = "euclidean_distances"
 _TABLE_COSINE = "cosine_distances"
 _TABLE_DDTW = "ddtw_distances"
 
+_CACHE_FLUSH_ROWS = 4096
+
 
 def _open_cache(pkl_path: Path) -> tuple[duckdb.DuckDBPyConnection, Path]:
     """Open / create a .cache.duckdb next to the .pkl file."""
@@ -126,7 +128,8 @@ def _open_cache(pkl_path: Path) -> tuple[duckdb.DuckDBPyConnection, Path]:
     n_euc = con.execute(f"SELECT COUNT(*) FROM {_TABLE_EUCLIDEAN}").fetchone()[0]
     n_cos = con.execute(f"SELECT COUNT(*) FROM {_TABLE_COSINE}").fetchone()[0]
     n_ddtw = con.execute(f"SELECT COUNT(*) FROM {_TABLE_DDTW}").fetchone()[0]
-    typer.echo(f"  Cache: {cache_path}  (dtw={n_dtw:,}, euclidean={n_euc:,}, cosine={n_cos:,}, ddtw={n_ddtw:,} entries)")
+    typer.echo(
+        f"  Cache: {cache_path}  (dtw={n_dtw:,}, euclidean={n_euc:,}, cosine={n_cos:,}, ddtw={n_ddtw:,} entries)")
     return con, cache_path
 
 
@@ -314,16 +317,15 @@ def _compute_pairwise_dtw(
                     cached[(a, b)] = d
                     batch.append((a, b, radius, d, t))
                     pbar.update(1)
-                    if len(batch) >= chunksize:
+                    if len(batch) >= _CACHE_FLUSH_ROWS:
                         _insert_dtw(con, batch)
-                        con.execute("CHECKPOINT")
                         batch.clear()
         if batch:
             _insert_dtw(con, batch)
-            con.execute("CHECKPOINT")
+        con.execute("CHECKPOINT")
 
-    # Query total CPU time from cache for these pairs
-    total_cpu_s = con.execute(f"SELECT COALESCE(SUM(calc_time_s), 0) FROM {_TABLE_DTW} WHERE radius = ?", [radius]).fetchone()[0]
+    total_cpu_s = \
+        con.execute(f"SELECT COALESCE(SUM(calc_time_s), 0) FROM {_TABLE_DTW} WHERE radius = ?", [radius]).fetchone()[0]
     return cached, float(total_cpu_s)
 
 
@@ -433,13 +435,12 @@ def _compute_pairwise_ddtw(
                     cached[(a, b)] = d
                     batch.append((a, b, K, d, t))
                     pbar.update(1)
-                    if len(batch) >= chunksize:
+                    if len(batch) >= _CACHE_FLUSH_ROWS:
                         _insert_ddtw(con, batch)
-                        con.execute("CHECKPOINT")
                         batch.clear()
         if batch:
             _insert_ddtw(con, batch)
-            con.execute("CHECKPOINT")
+        con.execute("CHECKPOINT")
 
     total_cpu_s = con.execute(f"SELECT COALESCE(SUM(calc_time_s), 0) FROM {_TABLE_DDTW} WHERE K = ?", [K]).fetchone()[0]
     return cached, float(total_cpu_s)
@@ -687,7 +688,7 @@ def _build_row(
 
 
 def _print_results(test_stats: dict, train_stats: dict, threshold: float, metric: str, multi_run: bool) -> None:
-    typer.echo(f"\n{'='*50}")
+    typer.echo(f"\n{'=' * 50}")
     typer.echo(f"  threshold      : {threshold:.6f}")
     for split_name, stats in [("train", train_stats), ("test", test_stats)]:
         for m in ("mcc", "f1", "accuracy", "precision", "recall"):
@@ -703,7 +704,8 @@ def _print_results(test_stats: dict, train_stats: dict, threshold: float, metric
         typer.echo(f"  {'mrr':12s} {'test':5s}: {mrr_val:.4f} ± {mrr_std:.4f}")
     else:
         typer.echo(f"  {'mrr':12s} {'test':5s}: {mrr_val:.4f}")
-    typer.echo(f"{'='*50}")
+    typer.echo(f"{'=' * 50}")
+
 
 # ---------------------------------------------------------------------------
 # CLI: DTW subcommand
@@ -713,10 +715,12 @@ def _print_results(test_stats: dict, train_stats: dict, threshold: float, metric
 def evaluate_dtw(
         pkl_path: Path = typer.Argument(..., help="Path to a single colocation .pkl dataset."),
         results_csv: Path = typer.Argument(..., help="CSV file to append results to."),
-        sample: Optional[float] = typer.Option(None, help="Fraction of recordings to sample (0–1). Uses seed for reproducibility."),
+        sample: Optional[float] = typer.Option(None,
+                                               help="Fraction of recordings to sample (0–1). Uses seed for reproducibility."),
         # Parallelism
         workers: Optional[int] = typer.Option(None, help="Parallel workers (default: all CPU cores)."),
-        chunksize: int = typer.Option(32, help="Chunk size for parallel worker dispatch (higher = less IPC overhead, coarser progress)."),
+        chunksize: int = typer.Option(32,
+                                      help="Chunk size for parallel worker dispatch (higher = less IPC overhead, coarser progress)."),
         # DTW-specific
         radius: int = typer.Option(1, help="DTW Sakoe-Chiba radius."),
         # Evaluation
@@ -738,7 +742,10 @@ def evaluate_dtw(
     if _result_exists(results_csv, pkl_path.name, "dtw", radius):
         typer.echo(f"Result already exists for {pkl_path.name} (dtw, r={radius}). Printing cached result.")
         df = pd.read_csv(results_csv)
-        row = df[(df["dataset_file"] == pkl_path.name) & (df["distance_function"] == "dtw") & (df["radius"] == radius)].iloc[-1]
+        row = \
+            df[(df["dataset_file"] == pkl_path.name) & (df["distance_function"] == "dtw") & (
+                        df["radius"] == radius)].iloc[
+                -1]
         typer.echo(row.to_string())
         return
 
@@ -756,7 +763,8 @@ def evaluate_dtw(
     all_distances, total_cpu_s = _compute_pairwise_dtw(data, radius, n_workers_val, con, chunksize=chunksize)
     total_time = time.perf_counter() - t0
     total_cpu_h = total_cpu_s / 3600.0
-    typer.echo(f"  Distance computation: {total_time:.1f}s wall, {total_cpu_h:.2f} CPU-hours ({len(all_distances):,} pairs total)")
+    typer.echo(
+        f"  Distance computation: {total_time:.1f}s wall, {total_cpu_h:.2f} CPU-hours ({len(all_distances):,} pairs total)")
 
     seed_int = resolve_seed(seed)
     multi_run = runs > 1
@@ -806,7 +814,8 @@ def evaluate_dtw(
 def evaluate_euclidean(
         pkl_path: Path = typer.Argument(..., help="Path to a single colocation .pkl dataset."),
         results_csv: Path = typer.Argument(..., help="CSV file to append results to."),
-        sample: Optional[float] = typer.Option(None, help="Fraction of recordings to sample (0–1). Uses seed for reproducibility."),
+        sample: Optional[float] = typer.Option(None,
+                                               help="Fraction of recordings to sample (0–1). Uses seed for reproducibility."),
         # Parallelism
         workers: Optional[int] = typer.Option(None, help="Parallel workers (default: all CPU cores)."),
         chunksize: int = typer.Option(1000,
@@ -848,7 +857,8 @@ def evaluate_euclidean(
     all_distances, total_cpu_s = _compute_pairwise_euclidean(data, n_workers_val, con, chunksize=chunksize)
     total_time = time.perf_counter() - t0
     total_cpu_h = total_cpu_s / 3600.0
-    typer.echo(f"  Distance computation: {total_time:.1f}s wall, {total_cpu_h:.2f} CPU-hours ({len(all_distances):,} pairs total)")
+    typer.echo(
+        f"  Distance computation: {total_time:.1f}s wall, {total_cpu_h:.2f} CPU-hours ({len(all_distances):,} pairs total)")
 
     seed_int = resolve_seed(seed)
     multi_run = runs > 1
@@ -898,7 +908,8 @@ def evaluate_euclidean(
 def evaluate_cosine(
         pkl_path: Path = typer.Argument(..., help="Path to a single colocation .pkl dataset."),
         results_csv: Path = typer.Argument(..., help="CSV file to append results to."),
-        sample: Optional[float] = typer.Option(None, help="Fraction of recordings to sample (0–1). Uses seed for reproducibility."),
+        sample: Optional[float] = typer.Option(None,
+                                               help="Fraction of recordings to sample (0–1). Uses seed for reproducibility."),
         # Parallelism
         workers: Optional[int] = typer.Option(None, help="Parallel workers (default: all CPU cores)."),
         chunksize: int = typer.Option(1000,
@@ -940,7 +951,8 @@ def evaluate_cosine(
     all_distances, total_cpu_s = _compute_pairwise_cosine(data, n_workers_val, con, chunksize=chunksize)
     total_time = time.perf_counter() - t0
     total_cpu_h = total_cpu_s / 3600.0
-    typer.echo(f"  Distance computation: {total_time:.1f}s wall, {total_cpu_h:.2f} CPU-hours ({len(all_distances):,} pairs total)")
+    typer.echo(
+        f"  Distance computation: {total_time:.1f}s wall, {total_cpu_h:.2f} CPU-hours ({len(all_distances):,} pairs total)")
 
     seed_int = resolve_seed(seed)
     multi_run = runs > 1
@@ -990,10 +1002,12 @@ def evaluate_cosine(
 def evaluate_ddtw(
         pkl_path: Path = typer.Argument(..., help="Path to a single colocation .pkl dataset."),
         results_csv: Path = typer.Argument(..., help="CSV file to append results to."),
-        sample: Optional[float] = typer.Option(None, help="Fraction of recordings to sample (0–1). Uses seed for reproducibility."),
+        sample: Optional[float] = typer.Option(None,
+                                               help="Fraction of recordings to sample (0–1). Uses seed for reproducibility."),
         # Parallelism
         workers: Optional[int] = typer.Option(None, help="Parallel workers (default: all CPU cores)."),
-        chunksize: int = typer.Option(32, help="Chunk size for parallel worker dispatch (higher = less IPC overhead, coarser progress)."),
+        chunksize: int = typer.Option(32,
+                                      help="Chunk size for parallel worker dispatch (higher = less IPC overhead, coarser progress)."),
         # DDTW-specific
         K: int = typer.Option(10, "--K", "-K", help="DDTW window size parameter (window = 2*K)."),
         # Evaluation
@@ -1015,7 +1029,9 @@ def evaluate_ddtw(
     if _result_exists(results_csv, pkl_path.name, "ddtw", K):
         typer.echo(f"Result already exists for {pkl_path.name} (ddtw, K={K}). Printing cached result.")
         df = pd.read_csv(results_csv)
-        row = df[(df["dataset_file"] == pkl_path.name) & (df["distance_function"] == "ddtw") & (df["radius"] == K)].iloc[-1]
+        row = \
+            df[(df["dataset_file"] == pkl_path.name) & (df["distance_function"] == "ddtw") & (df["radius"] == K)].iloc[
+                -1]
         typer.echo(row.to_string())
         return
 
@@ -1033,7 +1049,8 @@ def evaluate_ddtw(
     all_distances, total_cpu_s = _compute_pairwise_ddtw(data, K, n_workers_val, con, chunksize=chunksize)
     total_time = time.perf_counter() - t0
     total_cpu_h = total_cpu_s / 3600.0
-    typer.echo(f"  Distance computation: {total_time:.1f}s wall, {total_cpu_h:.2f} CPU-hours ({len(all_distances):,} pairs total)")
+    typer.echo(
+        f"  Distance computation: {total_time:.1f}s wall, {total_cpu_h:.2f} CPU-hours ({len(all_distances):,} pairs total)")
 
     seed_int = resolve_seed(seed)
     multi_run = runs > 1
@@ -1043,7 +1060,6 @@ def evaluate_ddtw(
 
     _print_results(test_stats, train_stats, threshold, metric, multi_run)
 
-    # K is stored in the "radius" column to reuse the shared CSV schema
     if not results_csv.exists():
         results_csv.parent.mkdir(parents=True, exist_ok=True)
         pd.DataFrame(columns=_CSV_COLUMNS).to_csv(results_csv, index=False)
@@ -1074,6 +1090,7 @@ def evaluate_ddtw(
     typer.echo(f"  Results appended to {results_csv}")
 
     con.close()
+
 
 if __name__ == "__main__":
     app()

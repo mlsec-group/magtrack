@@ -1,2 +1,0 @@
-dataset_name,dataset_md5,extraction_function_name,duration,trainride_start_seconds,sensor_type,filter_train_type,start_delay,end_buffer,min_sample_frequency,rolling_window,normalize,sampling_rate,seed,num_samples
-all,ec0a1070b21676c20d7bdc746a1c001c,filter_notch_highpass,5,60,Magnetometer,"['long-distance', 'regional']",2,2,90.0,50,trace,40.0,magtrack,8904

@@ -55,8 +55,6 @@ class ColocDataset(Dataset):
         df = df.reset_index(drop=True)
         self.rng = np.random.default_rng(random_state)
 
-        # Pre-stack all magnitude vectors into one contiguous float32 array so
-        # __getitem__ is pure numpy indexing (no pandas access in workers).
         sigs = [row[magnitude_key].values for row in df[data_col].to_list()]
         self.signals = np.ascontiguousarray(np.stack(sigs).astype(np.float32))
         self.ids = pd.factorize(df[id_col], sort=False)[0].astype(np.int64)
@@ -127,7 +125,7 @@ class ColocSequentialEvalDataset(Dataset):
 
         #  Vectorized labels: 0 if same id (positive), 1 if different (negative).
         self.labels = (self.ids[i_idx] != self.ids[j_idx]).astype(np.int8)
-       
+
         positive_mask = (self.labels == 0)
         self.positive_pairs = self.pairs[positive_mask]
         self.num_positives = len(self.positive_pairs)

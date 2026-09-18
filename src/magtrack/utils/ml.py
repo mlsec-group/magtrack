@@ -1,13 +1,9 @@
-"""Shared ML training/evaluation helpers used by both the trainer and the
-hyperparameter search."""
-
 from __future__ import annotations
+
+from time import perf_counter
 
 import numpy as np
 import torch
-from time import perf_counter
-from tqdm import trange
-
 from sklearn.metrics import (
     accuracy_score,
     confusion_matrix,
@@ -143,7 +139,7 @@ def evaluate(model, signals, pairs, labels, batch_size, threshold=0.0, return_sc
     all_preds: list[torch.Tensor] = []
     all_scores: list[torch.Tensor] = [] if return_scores else None  # type: ignore[assignment]
     with torch.no_grad():
-        for start in trange(0, pairs.shape[0], batch_size):
+        for start in range(0, pairs.shape[0], batch_size):
             p = pairs[start:start + batch_size]
             x1 = signals[p[:, 0]]
             x2 = signals[p[:, 1]]

@@ -77,8 +77,6 @@ def _to_tb_scalar(value):
             return value.detach().cpu().numpy()
     if isinstance(value, (int, float, str, bool)):
         return value
-    # add_hparams only accepts int/float/str/bool/Tensor — coerce lists, None,
-    # dicts, etc. to a string representation.
     return str(value)
 
 
@@ -88,7 +86,7 @@ def _build_model_from_hparams(hparams_path: Path) -> tuple[ColocationCNN, dict]:
     with open(hparams_path, encoding="utf-8") as fh:
         h = yaml.safe_load(fh) or {}
 
-    target_len = 30*10#int(h.get("chunk_size_seconds", 20) * h.get("hz", 40))
+    target_len = 30 * 10
     conv_channels, kernel_sizes, strides, paddings, pool_kernel_sizes, pool_strides = _resolve_conv_hparams(h)
 
     model = ColocationCNN(
@@ -361,7 +359,8 @@ def train(
 
 @app.command("main")
 def train_ml(
-        dataset_path: Path = typer.Argument(..., help="One path to ml dataset (pkl)"),
+        dataset_path: str = typer.Option("from_config",
+                                         help="Path to ml dataset (pkl) or 'from_config' to read from model_hparams.yaml"),
         test_fraction: float = typer.Option(0.3, help="Fraction of data to use for testing"),
         log_signal_every: int = typer.Option(10, help="Log sample signal plots every N epochs"),
         log_batch_loss_every: int = typer.Option(10, help="Log batch loss every N global steps"),
@@ -378,8 +377,8 @@ def train_ml(
         preload_workers: int = typer.Option(
             0,
             help=(
-                "Number of worker processes to build train/test arrays in parallel. "
-                "Use 0 or 1 to disable."
+                    "Number of worker processes to build train/test arrays in parallel. "
+                    "Use 0 or 1 to disable."
             ),
         ),
 ):
@@ -390,6 +389,10 @@ def train_ml(
         batch_size = h.get("batch_size", batch_size)
         learning_rate = h.get("lr", learning_rate)
         weight_decay = h.get("weight_decay", weight_decay)
+        hz = h.get("hz", 10)
+        chunk_size_seconds = h.get("chunk_size_seconds", 60)
+        train_ride_start_seconds = h.get("train_ride_start_seconds", 300)
+        window_size_seconds = h.get("window_size_seconds", 10)
 
     # Training/optimizer settings (selected from prior tuning).
     epochs = epochs
@@ -410,6 +413,15 @@ def train_ml(
     torch.manual_seed(seed_int)
     g = torch.Generator()
     g.manual_seed(seed_int)
+
+    if dataset_path == "from_config":
+        dataset_path = Path(
+            f"/data/all_coloc_first{train_ride_start_seconds}_{chunk_size_seconds}s_window{window_size_seconds}_{hz}Hz.pkl")
+    else:
+        dataset_path = Path(dataset_path)
+
+    if not dataset_path.exists():
+        raise FileNotFoundError(f"Dataset file not found: {dataset_path}")
 
     data = read_pickle(dataset_path)
     metadata_df = get_metadata_from_dataset(dataset_path)
@@ -505,14 +517,28 @@ def train_ml(
     eval_model.load_state_dict(torch.load("coloc_model/colocation_net.pth", map_location=device))
     eval_model.eval()
 
-    acc, precision, recall, f1, prevalence, specificity, negative_predictive_value, mcc = evaluate(
+    metrics = evaluate(
         eval_model,
         test_signals,
         test_pairs,
         test_labels,
         batch_size,
         threshold=0.0,
-    )  # type: ignore[misc]
+    )
+
+    acc = metrics["acc"]
+    precision = metrics["precision"]
+    recall = metrics["recall"]
+    f1 = metrics["f1"]
+    prevalence = metrics["prevalence"]
+    specificity = metrics["specificity"]
+    npv = metrics["npv"]
+    mcc = metrics["mcc"]
+    tp = metrics["tp"]
+    fp = metrics["fp"]
+    tn = metrics["tn"]
+    fn = metrics["fn"]
+    total = metrics["total"]
 
     logger.info("Final metrics: accuracy={}, precision={}, recall={}, f1={}, mcc={}", acc, precision, recall, f1, mcc)
 
@@ -532,7 +558,7 @@ def train_ml(
         "hparam/final_recall": recall,
         "hparam/final_prevalence": prevalence,
         "hparam/final_specificity": specificity,
-        "hparam/final_negative_predictive_value": negative_predictive_value,
+        "hparam/final_negative_predictive_value": npv,
         "hparam/final_mcc": mcc,
     }
 

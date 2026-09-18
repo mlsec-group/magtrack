@@ -28,8 +28,6 @@ def get_chunked_dataframe(
     if end_time is None:
         end_time = df[time_column].max()
 
-    # Build fixed windows [start, start + duration] and move by duration.
-    # Inclusive end creates minimal overlap (boundary sample) between neighbors.
     while (current_start + duration_td) <= end_time:
         current_end = current_start + duration_td
         chunk = df[(df[time_column] >= current_start) & (df[time_column] <= current_end)].copy()

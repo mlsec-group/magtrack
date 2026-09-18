@@ -56,7 +56,8 @@ def format_data(
         trace = filter_abs(data, timestamp_column=time_column)
         trace['timestamp'] = pd.to_datetime(trace['timestamp'], unit='s')
         if trainride_flag and trainride_start_seconds > 0:
-            trace = trace[trace['timestamp'] < (trace['timestamp'].min() + pd.Timedelta(seconds=trainride_start_seconds + 1))]
+            trace = trace[
+                trace['timestamp'] < (trace['timestamp'].min() + pd.Timedelta(seconds=trainride_start_seconds + 1))]
     except KeyError:
         logger.error(f"Missing required columns in data from {zip_path}")
         return pd.DataFrame()
@@ -139,8 +140,8 @@ def process_zip(
                         continue
                 data = get_trainride_data(zip_path, label_rows)
                 final_data = pd.concat([final_data,
-                                       format_data(data, zip_path, duration, trainride_flag, min_sample_frequency,
-                                                   only_complete_recordings, trainride_start_seconds, trip)])
+                                        format_data(data, zip_path, duration, trainride_flag, min_sample_frequency,
+                                                    only_complete_recordings, trainride_start_seconds, trip)])
         except FileNotFoundError:
             logger.error(f"No labels found for {zip_path}, skipping trainride processing")
             return pd.DataFrame()

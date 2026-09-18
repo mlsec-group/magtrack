@@ -1,0 +1,30 @@
+\begin{table}[htbp]
+\centering
+\caption{Best hyperparameters from the Optuna search after 200 epochs. A dash marks layers that are not present.}
+\label{tab:optuna_hparams}
+\small
+\setlength{\tabcolsep}{5pt}
+\begin{tabular}{lccccc}
+\toprule
+Trial & 897 & 913 & 914 & 959 & 964 \\
+\midrule
+MCC            & 0.712 & 0.655 & 0.728 & 0.725 & 0.738 \\
+\addlinespace
+Conv.\ layers  & 4 & 4 & 4 & 4 & 4 \\
+Base channels  & 16 & 64 & 64 & 16 & 32 \\
+Kernel size    & 5 & 3 & 7 & 3 & 7 \\
+Stride         & 1 & 2 & 2 & 2 & 1 \\
+Pool kernel    & 2 & 2 & 3 & 2 & 2 \\
+\addlinespace
+FC layers      & 4 & 2 & 3 & 2 & 2 \\
+FC width 1     & 256 & 512 & 256 & 256 & 512 \\
+FC width 2     & 256 & 256 & 256 & 64  & 256 \\
+FC width 3     & 128 & --  & 64  & --  & --  \\
+FC width 4     & 256 & --  & --  & --  & --  \\
+\addlinespace
+Dropout        & 0.171 & 0.070 & 0.171 & 0.166 & 0.130 \\
+Learning rate  & 0.001 & 0.003 & 0.003 & 0.003 & 0.030 \\
+Batch size     & 32 & 128 & 64 & 64 & 256 \\
+\bottomrule
+\end{tabular}
+\end{table}
