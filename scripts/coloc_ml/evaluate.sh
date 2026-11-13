@@ -32,10 +32,12 @@ COLOC_RESULTS_DIR="${COLOC_RESULTS_DIR:-${REPO_ROOT}/results}"
 COLOC_DATA_DIR="${COLOC_DATA_DIR:-./datasets/coloc_datasets/normalized_trace_all_trains/}"
 COLOC_DATA_DIR_LONG_DISTANCE="${COLOC_DATA_DIR_LONG_DISTANCE:-./datasets/coloc_datasets/normalized_trace_long_distance_trains/}"
 COLOC_DATA_DIR_REGIONAL="${COLOC_DATA_DIR_REGIONAL:-./datasets/coloc_datasets/normalized_trace_regional_trains/}"
+EVAL_MODEL="${EVAL_MODEL:-coloc_model/colocation_net.pth}"
+EVAL_HPARAMS="${EVAL_HPARAMS:-coloc_model/model_hparams.yaml}"
 
 # Inputs from the training step
-MODEL_OUTPUT="${REPO_ROOT}/coloc_model/colocation_net.pth"
-HPARAMS_PATH="${REPO_ROOT}/coloc_model/model_hparams.yaml"
+MODEL_OUTPUT="${REPO_ROOT}/${EVAL_MODEL}"
+HPARAMS_PATH="${REPO_ROOT}/${EVAL_HPARAMS}"
 
 # Dataset & evaluation paths
 DATA_DIR="${COLOC_DATA_DIR}"
@@ -51,6 +53,9 @@ MAJORITY_SCRIPT="${REPO_ROOT}/scripts/coloc_ml/tmp/eval_majority_ml.sh"
 
 TEST_FRACTION="${COLOC_TEST_FRACTION:-0.3}"
 SEED="${COLOC_SEED:-"magtrack"}"
+
+# Runtime computation:
+START_TIME=$(date +%s)
 
 # ── GPU detection ─────────────────────────────────────────────────────────────
 # GPU work needs the NVIDIA stack passed into the container via --nv, and the
@@ -363,3 +368,8 @@ echo "   Long distance:      ${EVAL_SCRIPT_LONG_DISTANCE}"
 echo "   Regional:           ${EVAL_SCRIPT_REGIONAL}"
 echo "   Majority script:    ${MAJORITY_SCRIPT}"
 echo "=============================================================================="
+
+END_TIME=$(date +%s)
+ELAPSED_TIME=$((END_TIME - START_TIME))
+echo ""
+echo "Total elapsed time: ${ELAPSED_TIME} seconds"

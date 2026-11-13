@@ -9,6 +9,7 @@ import pandas as pd
 import typer
 from loguru import logger
 
+from magtrack.paper.generate_longvsregional_table import DURATION_WORDS, ML_MACROS, load_mcc_csv
 from magtrack.utils.results import load_and_prepare_coloc_results, load_best_tmd_results
 
 app = typer.Typer(help="Magtrack Paper latex vars")
@@ -55,8 +56,14 @@ def ml_results(
         results_file: Path = typer.Argument(..., help="Path to evaluation_results.result_ml.csv"),
         output_file: str = typer.Argument(..., help="Path to output .tex file"),
         round_digits: int = typer.Option(2, "-r", "--round", help="Number of decimal places to round score values to"),
+        long_distance_results: Optional[Path] = typer.Option(
+            None, "--long-distance-results",
+            help="Results CSV of the long-distance trains (default: long_distance/<name> next to the results file)"),
+        regional_results: Optional[Path] = typer.Option(
+            None, "--regional-results",
+            help="Results CSV of the regional trains (default: regional/<name> next to the results file)"),
 ) -> None:
-    """Find the overall best F1 and MCC scores, plus specific chunk/duration stats."""
+    """Find the overall best F1 and MCC scores, plus specific chunk/duration and train-type stats."""
     if not results_file.is_file():
         logger.error(f"File not found: {results_file}")
         raise typer.Exit(code=1)
@@ -153,6 +160,49 @@ def ml_results(
 
             tex_commands.append(
                 f"\\newcommand{{\\{tex_name}}}{{\\numprint{{{mean_fmt}}}\\xspace}}"
+            )
+
+    # ---------------------------------------------------------
+    # 3. Best MCC per train type and 'first' duration (ML rows of mcc_train_types.tex)
+    # ---------------------------------------------------------
+    train_type_files = {
+        "All": results_file,
+        "Long distance": long_distance_results or results_file.parent / "long_distance" / results_file.name,
+        "Regional": regional_results or results_file.parent / "regional" / results_file.name,
+    }
+
+    for train_type, train_type_file in train_type_files.items():
+        _, grouped = load_mcc_csv(train_type_file, train_type)
+        if not grouped:
+            logger.warning(f"No results for train type '{train_type}' in {train_type_file}, skipping.")
+            continue
+
+        for dur, dur_word in DURATION_WORDS.items():
+            if dur not in grouped:
+                continue
+
+            mean_fmt = format(grouped[dur]["mean"], f".{digits_score}f")
+
+            tex_commands.append(
+                f"\\newcommand{{{ML_MACROS[train_type]}{dur_word}}}"
+                f"{{\\numprint{{{mean_fmt}}}\\xspace}}"
+            )
+
+        # Overall best (across all durations) for this train type, mirroring
+        # the "Overall Best Configuration" macros generated for the All type above.
+        if train_type != "All":
+            base_macro = ML_MACROS[train_type]
+            if base_macro.endswith("First"):
+                base_macro = base_macro[: -len("First")]
+
+            best_dur = max(grouped, key=lambda d: grouped[d]["mean"])
+            best_mean_fmt = format(grouped[best_dur]["mean"], f".{digits_score}f")
+
+            tex_commands.append(
+                f"\\newcommand{{{base_macro}Overall}}{{\\numprint{{{best_mean_fmt}}}\\xspace}}"
+            )
+            tex_commands.append(
+                f"\\newcommand{{{base_macro}Duration}}{{{best_dur}\\xspace}}"
             )
 
     for cmd in tex_commands:

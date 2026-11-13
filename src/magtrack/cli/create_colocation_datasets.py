@@ -31,6 +31,42 @@ def _parse_dataset_spec(spec: str) -> tuple[str, list[str], str]:
     return name, train_types, output_dir
 
 
+def _parse_extraction_args(pairs: list[str]) -> dict:
+    """Parse repeatable ``key=value`` options into kwargs for the extraction function.
+
+    Values are coerced to int/float/bool where possible so that e.g. ``Q=10``
+    reaches the filter as a number rather than the string ``"10"``.
+    """
+    args = {}
+    for pair in pairs:
+        if '=' not in pair:
+            raise typer.BadParameter(
+                f"Invalid extraction function argument {pair!r}: expected key=value")
+        key, raw = pair.split('=', 1)
+        key, raw = key.strip(), raw.strip()
+        if not key:
+            raise typer.BadParameter(f"Invalid extraction function argument {pair!r}: empty key")
+        if raw.lower() in ('true', 'false'):
+            value = raw.lower() == 'true'
+        else:
+            try:
+                value = int(raw)
+            except ValueError:
+                try:
+                    value = float(raw)
+                except ValueError:
+                    value = raw
+        args[key] = value
+    return args
+
+
+def _extraction_args_slug(args: dict) -> str:
+    """Filename suffix identifying non-default extraction arguments (empty if none)."""
+    if not args:
+        return ''
+    return '_' + '_'.join(f"{key}{value}" for key, value in sorted(args.items()))
+
+
 @app.command("create")
 def create(
         dataset_path: Path = typer.Option(..., help="Path to traintrack dataset (yaml)"),
@@ -45,6 +81,10 @@ def create(
             help="Dataset to emit as 'name:train_type[,train_type][:output_dir]'. Repeatable."),
         extraction_function_name: str = typer.Option("filter_notch_highpass",
                                                      help="Name of extraction function in utils.filters"),
+        extraction_function_arg: list[str] = typer.Option(
+            [], "--extraction-function-arg",
+            help="Extra keyword argument for the extraction function as 'key=value' "
+                 "(e.g. 'Q=10'). Repeatable."),
         sensor_type: str = typer.Option("Magnetometer", help="Sensor type to extract from zipfiles"),
         start_delay: int = typer.Option(2, help="Seconds to delay from recording start"),
         end_buffer: int = typer.Option(2, help="Seconds to trim from the end of each recording"),
@@ -79,6 +119,8 @@ def create(
         typer.echo(f"Failed to import extraction function {extraction_function_name}.", err=True)
         raise typer.Exit(1)
 
+    extraction_function_args = _parse_extraction_args(extraction_function_arg)
+
     allowed_norms = {"none", "chunk", "trace"}
     if normalize not in allowed_norms:
         raise typer.BadParameter(f"normalize must be one of {sorted(allowed_norms)}")
@@ -90,7 +132,7 @@ def create(
         if trace_cache_dir is None:
             raise typer.BadParameter("--warm-trace-cache-only requires --trace-cache-dir")
         cached, total = warm_trace_cache(dataset_path, train_types, EXTRACTION_FUNCTION,
-                                         extraction_function_name, sensor_type, trace_cache_dir)
+                                         extraction_function_name, extraction_function_args, sensor_type, trace_cache_dir)
         typer.echo(f"Cached {cached}/{total} traces in {trace_cache_dir}")
         return
 
@@ -108,6 +150,7 @@ def create(
         train_types=train_types,
         extraction_function=EXTRACTION_FUNCTION,
         extraction_function_name=extraction_function_name,
+        extraction_function_args=extraction_function_args,
         sensor_type=sensor_type,
         start_delay=start_delay,
         end_buffer=end_buffer,
@@ -140,6 +183,7 @@ def create(
                 sampling_rate=sampling_rate_value,
                 rolling_window=rolling_window_value,
                 extraction_function_name=extraction_function_name,
+                extraction_function_args=extraction_function_args,
                 sensor_type=sensor_type,
                 start_delay=start_delay,
                 end_buffer=end_buffer,
@@ -156,8 +200,8 @@ def create(
 
 def _write_dataset(rows, row_types, dataset_name, filter_train_type, output_path, duration,
                    trainride_start_seconds, sampling_rate, rolling_window, extraction_function_name,
-                   sensor_type, start_delay, end_buffer, min_sample_frequency, normalize, seed,
-                   overwrite, compression) -> int:
+                   extraction_function_args, sensor_type, start_delay, end_buffer,
+                   min_sample_frequency, normalize, seed, overwrite, compression) -> int:
     out_filename = (f"{dataset_name}_coloc_first{trainride_start_seconds}_{duration}s_"
                     f"window{rolling_window}_{int(sampling_rate)}Hz.pkl")
     out_file = os.path.join(output_path, out_filename)
@@ -210,6 +254,7 @@ def _write_dataset(rows, row_types, dataset_name, filter_train_type, output_path
         'dataset_name': [dataset_name],
         'dataset_md5': [hashlib.md5(open(out_file, 'rb').read()).hexdigest()],
         'extraction_function_name': [extraction_function_name],
+        'extraction_function_args': [repr(sorted(extraction_function_args.items()))],
         'duration': [duration],
         'trainride_start_seconds': [trainride_start_seconds],
         'sensor_type': [sensor_type],

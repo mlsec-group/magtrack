@@ -1,3 +1,4 @@
+import hashlib
 from typing import Dict, Tuple
 
 import numpy as np
@@ -124,6 +125,31 @@ def train_test_split(data: pd.DataFrame, test_frac: float, random_state: int, sp
     test_set = data[data[split_column].isin(sampled_ids)]
     train_set = data[~data[split_column].isin(sampled_ids)]
     return train_set, test_set
+
+
+def consistent_train_test_split(data: pd.DataFrame, test_frac: float, random_state: int,
+                                split_column: str = 'segment_id') -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Split the data into training and testing sets based on unique IDs, consistently across datasets.
+
+    Unlike ``train_test_split``, an ID's side does not depend on which other IDs are in the
+    data: an ID goes to the test set if a seeded hash of it falls below ``test_frac``. A segment
+    that is in several datasets (e.g. other ride start offsets, rolling windows or train types)
+    is therefore in the training set of all of them or in the test set of all of them, so a
+    model trained on one dataset is never evaluated on its own training chunks in another.
+    The test set holds approximately, not exactly, ``test_frac`` of the IDs.
+    """
+    if split_column not in data.columns or data.empty:
+        raise ValueError(f"No unique IDs found in the data. Ensure '{split_column}' column exists and is not empty.")
+
+    def _unit_hash(value) -> float:
+        digest = hashlib.sha256(f"{random_state}:{value}".encode()).digest()
+        return int.from_bytes(digest[:8], "big") / 2 ** 64
+
+    unique_ids = data[split_column].unique()
+    test_ids = [i for i in unique_ids if _unit_hash(i) < test_frac]
+    is_test = data[split_column].isin(test_ids)
+    return data[~is_test], data[is_test]
 
 
 def flatten_pairwise_exclude_diag(distances: np.ndarray, classes: np.ndarray) -> Tuple[np.ndarray, np.ndarray, int]:

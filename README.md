@@ -8,10 +8,17 @@ This is the artifact repository for the publication:
 
 | |                                           |
 | --- |-------------------------------------------|
+| Paper | <https://www.mlsec.tu-berlin.de/docs/2026b-ccs.pdf> |
 | Code (this repository) | <https://github.com/mlsec-group/magtrack> |
 | Code, archived snapshot | <https://doi.org/10.5281/zenodo.22662413> |
 | TrainTrack dataset | <https://doi.org/10.5281/zenodo.22206115> |
 | License | CC BY-SA 4.0 (paper, code and data)       |
+
+> Version notes (v2, 12.11.2026)
+> We discovered an error in the first version of our code that affects the results presented in the paper original published version.
+> The signal processing was not as described in the paper and there was data leakage between training and test sets of the learning-based approach. 
+> With the corrected implementation the distance-based approach performs better than before.
+> Please always refer to [this updated version](https://www.mlsec.tu-berlin.de/docs/2026b-ccs.pdf).
 
 ## Overview
 
@@ -159,6 +166,7 @@ src/magtrack/
 scripts/
   download.sh build.sh check.sh      set-up helpers
   prepare_datasets.sh                runs all four dataset-creation steps
+  verify_datasets.sh                 checks the datasets against their checksums
   dataset_creation/                  build the datasets from the raw recordings
   tmd/                               transport mode detection            (E1)
   coloc_baseline/                    colocation baseline, DDTW           (E2)
@@ -217,6 +225,13 @@ The scripts run under GNU parallel inside the container and cap the number of wo
 | `COLOC_MEMORY_PER_JOB_GIB` | memory budgeted per job (default 8) |
 | `COLOC_MEMORY_FREE_TO_START` | free memory needed to start a job (default 12G) |
 | `PAPER_REBUILD_STATS=0` | reuse the shipped `traintrack_stats.yml` instead of recomputing it |
+
+At the end, the script writes a SHA-256 checksum of every dataset to `results/datasets/<type>.sha256`.
+To check the datasets against them later, run:
+
+```bash
+scripts/verify_datasets.sh
+```
 
 ## Reproducing the results
 

@@ -4,6 +4,16 @@ import torch.nn.functional as F
 
 
 class ColocationCNN(nn.Module):
+    """Siamese network that compares the two signals over time before pooling.
+
+    A shared conv encoder maps each signal to a feature sequence (B, C, L'). Because both signals
+    pass through the same layers, the two sequences stay time-aligned and are compared per time
+    step via [|f1 - f2|, f1 * f2]. A conv head over this comparison sequence is then reduced by
+    global average + max pooling and classified by the FC layers. `max_head_channels` caps the
+    width of the head. `input_channels` is kept for compatibility; the encoder always processes
+    one signal. The output is symmetric in (x1, x2): one logit per pair, 1 = not colocated.
+    """
+
     def __init__(
             self,
             input_channels=2,
@@ -18,6 +28,7 @@ class ColocationCNN(nn.Module):
             pool_strides=None,
             fc_hidden_dims=None,
             fc_dropout=0.0,
+            max_head_channels=128,
     ):
         super(ColocationCNN, self).__init__()
 
@@ -44,9 +55,10 @@ class ColocationCNN(nn.Module):
                 pool_kernel_sizes) == len(pool_strides)):
             raise ValueError("Conv/pool parameter lists must be the same length.")
 
+        # Shared encoder: one signal (B, 1, L) -> feature sequence (B, C, L')
+        in_channels = 1
         if self.num_conv_layers > 0:
             conv_blocks = []
-            in_channels = input_channels
             for out_channels, kernel_size, stride, padding, pool_k, pool_s in zip(
                     conv_channels, kernel_sizes, strides, paddings, pool_kernel_sizes, pool_strides
             ):
@@ -60,15 +72,17 @@ class ColocationCNN(nn.Module):
 
             self.cnn = nn.Sequential(*conv_blocks)
 
-            # Calculate the size after convolutions and pooling
-            self.conv_output_shape = self._get_conv_output_shape(2, signal_length)
+        # Head over the per-time-step comparison [|f1 - f2|, f1 * f2] (B, 2C, L')
+        head_channels = min(max(2 * in_channels, 16), max_head_channels)
+        self.compare = nn.Sequential(
+            nn.Conv1d(2 * in_channels, head_channels, kernel_size=3, padding=1),
+            nn.BatchNorm1d(head_channels),
+            nn.ReLU(),
+        )
 
-        # Build fully connected layers
+        # Build fully connected layers on the globally average + max pooled head output and comparison
         self.fc_layers = nn.ModuleList()
-        if self.num_conv_layers == 0:
-            prev_dim = input_channels * signal_length
-        else:
-            prev_dim = self.conv_output_shape
+        prev_dim = 2 * head_channels + 2 * (2 * in_channels)
 
         for hidden_dim in fc_hidden_dims:
             self.fc_layers.append(
@@ -109,19 +123,6 @@ class ColocationCNN(nn.Module):
                 if hasattr(m, 'bias') and m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def _get_conv_output_shape(self, input_channels, signal_length):
-        """Calculate output shape after conv and pooling layers"""
-        was_training = self.cnn.training
-        self.cnn.eval()
-        with torch.no_grad():
-            sample_input = torch.zeros(1, input_channels, signal_length)
-            print(f"Sample input shape for conv output calculation: {sample_input.shape}")
-            sample_input = self.cnn(sample_input)
-            output_dim = sample_input.view(1, -1).size(1)
-        if was_training:
-            self.cnn.train()
-        return output_dim
-
     def forward(self, x1, x2):
         if x1.size(1) != self.target_signal_length:
             x1 = F.interpolate(x1.unsqueeze(1), size=self.target_signal_length, mode="nearest-exact",
@@ -130,12 +131,16 @@ class ColocationCNN(nn.Module):
             x2 = F.interpolate(x2.unsqueeze(1), size=self.target_signal_length, mode="nearest-exact",
                                align_corners=None).squeeze(1)
 
-        x = torch.stack((x1, x2), dim=1)  # Shape: (batch_size, 2, L)
+        # Encode both signals in one pass so BatchNorm sees the same batch statistics for both sides.
+        x = torch.cat((x1, x2), dim=0).unsqueeze(1)  # Shape: (2 * batch_size, 1, L)
 
         if self.num_conv_layers > 0:
             x = self.cnn(x)
 
-        x = x.view(x.size(0), -1)
+        f1, f2 = x[:x1.size(0)], x[x1.size(0):]
+        c = torch.cat((torch.abs(f1 - f2), f1 * f2), dim=1)  # Shape: (batch_size, 2C, L')
+        h = self.compare(c)
+        x = torch.cat((h.mean(dim=2), h.amax(dim=2), c.mean(dim=2), c.amax(dim=2)), dim=1)
 
         for fc_layer in self.fc_layers:
             x = fc_layer(x)

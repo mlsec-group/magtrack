@@ -21,7 +21,7 @@ def plot_master_metrics(
                                         help="Path to master metrics CSV"),
         chunk_size: int = typer.Option(60, help="Chunk size as int (e.g., 5, 10, 20, 30, 60)"),
         window_size: int = typer.Option(1, help="Window size (e.g., 1, 5, 10, 50, 100, 150)"),
-        hz: int = typer.Option(10, help="Hz sampling rate (e.g., 10, 20, 40, 60)"),
+        hz: int = typer.Option(40, help="Hz sampling rate (e.g., 10, 20, 40, 60)"),
         output_format: str = typer.Option("pdf", help="Output format for plots (pdf or pgf)"),
         out_dir: Path = typer.Option(Path("results/paper/figures"), help="Output directory for the figures"),
 ):

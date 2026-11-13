@@ -408,17 +408,17 @@ def plot_metric_paper(df, metric, chunk, durations, args, out_path):
     print(f"Saved {display_metric} paper plot to {out_path}")
 
 
-def plot_metric_paper_single(df, metric, chunk, durations, args, out_path):
-    """Paper plotting function (single heatmap across duration; fixed 10 Hz)."""
+def plot_metric_paper_single(df, metric, chunk, durations, hz, args, out_path):
+    """Paper plotting function (single heatmap across duration at `hz` Hz)."""
     display_metric = format_metric_name(metric)
     duration_values = [d for d in durations if d != "all"]
     if not duration_values:
         print(f"Skipping {display_metric} (Paper Single): no duration values found")
         return
 
-    sub = df[(df["chunk"] == chunk) & (df["hz"] == 10) & (df["duration"].isin(duration_values))]
+    sub = df[(df["chunk"] == chunk) & (df["hz"] == hz) & (df["duration"].isin(duration_values))]
     if sub.empty:
-        print(f"Skipping {display_metric} (Paper Single): no data for chunk={chunk} s at 10 Hz")
+        print(f"Skipping {display_metric} (Paper Single): no data for chunk={chunk} s at {hz} Hz")
         return
 
     agg = sub.groupby(["window", "duration"])[metric].agg(["mean", "std"]).reset_index()
@@ -437,8 +437,8 @@ def plot_metric_paper_single(df, metric, chunk, durations, args, out_path):
     title_size = matplotlib.rcParams.get("axes.titlesize")
     annot_size = matplotlib.rcParams.get("axes.labelsize")
 
-    fig_w = get_column_width() * 0.7
-    fig_h = fig_w * 0.9
+    fig_w = get_column_width()
+    fig_h = fig_w * 0.85
     fig, ax = plt.subplots(figsize=(fig_w, fig_h))
     ax.grid(False)
 
@@ -456,7 +456,7 @@ def plot_metric_paper_single(df, metric, chunk, durations, args, out_path):
     ax.set_yticklabels([str(x) for x in pivot_mean.index], fontsize=ytick_size)
     ax.set_xlabel("Recording duration from train ride start (s)", fontsize=label_size)
     ax.set_ylabel("Rolling window size", fontsize=label_size)
-    ax.set_title("Data points per second: 10 Hz", fontsize=xtick_size)
+    ax.set_title(f"Data points per second: {hz} Hz", fontsize=xtick_size)
 
     for ii in range(data.shape[0]):
         for jj in range(data.shape[1]):
@@ -486,9 +486,9 @@ def main(
         durations_raw: str | None = typer.Option(None, "--durations",
                                                  help="Comma-separated durations (e.g. 300,900) or 'all'"),
         train_window: int = typer.Option(5, help="Training window_size_seconds"),
-        train_hz: int = typer.Option(40, help="Training hz"),
-        train_chunk: int = typer.Option(20, help="Training chunk_size_seconds"),
-        train_duration: int = typer.Option(0, help="Training first<duration> value in filename"),
+        train_hz: int = typer.Option(60, help="Training hz"),
+        train_chunk: int = typer.Option(60, help="Training chunk_size_seconds"),
+        train_duration: int = typer.Option(600, help="Training first<duration> value in filename"),
         max_cols: int = typer.Option(4, help="Maximum number of columns in grid mode"),
         output_format: str = typer.Option("pgf", help="Output file format for heatmaps: pgf|pdf"),
         show_scores: bool = typer.Option(False, help="Print numeric scores inside the heatmap cells"),
@@ -504,6 +504,8 @@ def main(
             True, "--paper-single-heatmaps/--no-paper-single-heatmaps",
             help="Write the single-row paper heatmap per metric ('<metric>_paper_single_<csv>').",
         ),
+        paper_chunk: int = typer.Option(60, help="Chunk size (s) to use for the paper plots."),
+        paper_hz: int = typer.Option(40, help="Sampling rate (Hz) to use for the single-row paper heatmap."),
 ) -> None:
     output_format = output_format.lower()
     if output_format not in {"pgf", "pdf"}:
@@ -516,6 +518,8 @@ def main(
         train_duration=train_duration,
         max_cols=max_cols,
         show_scores=show_scores,
+        paper_chunk=paper_chunk,
+        paper_hz=paper_hz,
     )
 
     print("Show scores inside heatmap cells:", args.show_scores)
@@ -595,7 +599,8 @@ def main(
             plot_metric_grid(df, metric, chunks, durations, args, out_path)
 
         # 2. Paper Plot (Fixed chunk size 30s, horizontal layout)
-        paper_chunk = 60
+        paper_chunk = args.paper_chunk
+        paper_hz = args.paper_hz
         if paper_chunk in paper_available_chunks:
             if paper_heatmaps:
                 paper_out_path = out_dir / f"{metric}_paper_{csv_name}.{output_format}"
@@ -608,6 +613,7 @@ def main(
                     metric,
                     paper_chunk,
                     paper_available_durations,
+                    paper_hz,
                     args,
                     paper_single_out_path,
                 )

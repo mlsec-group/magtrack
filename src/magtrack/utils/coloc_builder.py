@@ -1,3 +1,4 @@
+import hashlib
 import os
 from datetime import timedelta
 from pathlib import Path
@@ -41,13 +42,15 @@ def row_count(rows) -> int:
     return rows.stop - rows.start if isinstance(rows, slice) else int(rows.size)
 
 
-def _extract_trace(traintrack_basepath, zip_file, sensor_type, extraction_function) -> pd.DataFrame:
+def _extract_trace(traintrack_basepath, zip_file, sensor_type, extraction_function,
+                   extraction_function_args) -> pd.DataFrame:
     """Decode and filter one recording (everything except the rolling window)."""
     zip_file_path = os.path.join(traintrack_basepath, zip_file + '.zip')
     magnetometer_recording = get_data_from_zipfile_by_name(zip_file_path, sensor_type + '.csv')
 
     magnetometer_trace = extraction_function(magnetometer_recording,
-                                             timestamp_column='seconds_from_journey_start')
+                                             timestamp_column='seconds_from_journey_start',
+                                             **extraction_function_args)
     magnetometer_trace['timestamp'] = magnetometer_trace['timestamp'].apply(lambda x: timedelta(seconds=x))
     return magnetometer_trace
 
@@ -61,22 +64,28 @@ class TraceLoader:
     """
 
     def __init__(self, traintrack_basepath, sensor_type, extraction_function,
-                 extraction_function_name, cache_dir=None):
+                 extraction_function_name, extraction_function_args, cache_dir=None):
         self.traintrack_basepath = traintrack_basepath
         self.sensor_type = sensor_type
         self.extraction_function = extraction_function
         self.extraction_function_name = extraction_function_name
+        self.extraction_function_args = extraction_function_args
         self.cache_dir = Path(cache_dir) if cache_dir else None
         if self.cache_dir is not None:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     def _cache_file(self, zip_file) -> Path:
-        return self.cache_dir / f"{zip_file}.{self.sensor_type}.{self.extraction_function_name}.npz"
+        suffix = ''
+        if self.extraction_function_args:
+            identity = repr(sorted(self.extraction_function_args.items())).encode()
+            suffix = '.' + hashlib.md5(identity).hexdigest()[:8]
+        return (self.cache_dir /
+                f"{zip_file}.{self.sensor_type}.{self.extraction_function_name}{suffix}.npz")
 
     def load(self, zip_file) -> pd.DataFrame:
         if self.cache_dir is None:
             return _extract_trace(self.traintrack_basepath, zip_file, self.sensor_type,
-                                  self.extraction_function)
+                                  self.extraction_function, self.extraction_function_args)
 
         cache_file = self._cache_file(zip_file)
         if cache_file.exists():
@@ -92,7 +101,7 @@ class TraceLoader:
                 tqdm.write(f"Ignoring unusable trace cache {cache_file}: {exc}")
 
         trace = _extract_trace(self.traintrack_basepath, zip_file, self.sensor_type,
-                               self.extraction_function)
+                               self.extraction_function, self.extraction_function_args)
         tmp_file = cache_file.with_suffix(f".{os.getpid()}.tmp.npz")
         try:
             np.savez(
@@ -296,6 +305,7 @@ def build_rows(
         train_types,
         extraction_function,
         extraction_function_name,
+        extraction_function_args=None,
         sensor_type='Magnetometer',
         start_delay=2,
         end_buffer=2,
@@ -316,7 +326,8 @@ def build_rows(
     colocated_electric_trips, traintrack_segments = load_traintrack_trips(dataset_path, train_types)
 
     loader = TraceLoader(traintrack_basepath, sensor_type, extraction_function,
-                         extraction_function_name, trace_cache_dir)
+                         extraction_function_name, extraction_function_args or {},
+                         cache_dir=trace_cache_dir)
 
     # The grid excludes combinations in which the chunk is not longer than the
     # smoothing window; leaving them out here avoids building rows nobody wants.
@@ -396,7 +407,7 @@ def load_traintrack_trips(dataset_path, train_types):
 
 
 def warm_trace_cache(dataset_path, train_types, extraction_function, extraction_function_name,
-                     sensor_type, trace_cache_dir):
+                     extraction_function_args, sensor_type, trace_cache_dir):
     """Decode and cache every recording needed for ``train_types``.
 
     Running this once before a parallel grid avoids every worker decoding the
@@ -404,7 +415,8 @@ def warm_trace_cache(dataset_path, train_types, extraction_function, extraction_
     """
     colocated_electric_trips, _ = load_traintrack_trips(dataset_path, train_types)
     loader = TraceLoader(os.path.dirname(dataset_path), sensor_type, extraction_function,
-                         extraction_function_name, trace_cache_dir)
+                         extraction_function_name, extraction_function_args or {},
+                         cache_dir=trace_cache_dir)
     zip_files = list(dict.fromkeys(
         zip_file for zip_files in colocated_electric_trips['zip_files'] for zip_file in zip_files))
     cached = 0

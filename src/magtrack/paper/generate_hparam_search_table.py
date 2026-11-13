@@ -7,6 +7,8 @@ from pathlib import Path
 import optuna
 import typer
 
+from magtrack.cli.hyperparameter_search import BATCH_SIZE
+
 app = typer.Typer(help="Generate the Optuna hyperparameter search LaTeX table.")
 
 # Row label column width, so the '&' separators line up in the .tex source.
@@ -31,7 +33,7 @@ def main(
             help="Optuna study name inside the database.",
         ),
         n_trials: int = typer.Option(
-            5, "--n-trials", help="How many of the Pareto-front trials to list.",
+            5, "--n-trials", help="How many of the best trials (by MCC) to list.",
         ),
         max_epochs: int = typer.Option(
             200, "--max-epochs", help="Epoch count named in the caption.",
@@ -43,9 +45,10 @@ def main(
         raise typer.Exit(code=1)
 
     study = optuna.load_study(study_name=study_name, storage=f"sqlite:///{db_path}")
-    trials = study.best_trials[-n_trials:]
+    completed = study.get_trials(deepcopy=False, states=(optuna.trial.TrialState.COMPLETE,))
+    trials = sorted(completed, key=lambda t: t.value, reverse=True)[:n_trials]
     if not trials:
-        typer.echo("The study has no trials on the Pareto front.", err=True)
+        typer.echo("The study has no completed trials.", err=True)
         raise typer.Exit(code=1)
 
     params = [t.params for t in trials]
@@ -86,6 +89,7 @@ def main(
     print(_row("Kernel size", cells("kernel_size")))
     print(_row("Stride", cells("stride")))
     print(_row("Pool kernel", cells("pool_kernel")))
+    print(_row("Embedding dim", cells("embedding_dim")))
     print("\\addlinespace")
 
     print(_row("FC layers", cells("fc_layers")))
@@ -95,7 +99,7 @@ def main(
 
     print(_row("Dropout", cells("fc_dropout", "{:.3f}")))
     print(_row("Learning rate", cells("lr", "{:.3f}")))
-    print(_row("Batch size", cells("batch_size")))
+    print(_row("Batch size", [str(p.get("batch_size", BATCH_SIZE)) for p in params]))
 
     print("\\bottomrule")
     print("\\end{tabular}")

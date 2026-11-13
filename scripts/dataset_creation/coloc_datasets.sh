@@ -15,6 +15,7 @@ TRACE_CACHE_DIR="${COLOC_TRACE_CACHE_DIR:-${OUTPUT_BASE_DIR}/trace_cache}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 PYTHON_SIF="python.sif"
+FILTER_Q="${COLOC_FILTER_Q:-10}"
 
 # Parameter grid
 DURATIONS=(5 10 20 30 60)
@@ -53,6 +54,11 @@ for i in "${!DATASET_NAMES[@]}"; do
   SPEC_ARGS+=("--dataset-spec \"${dataset_name}:${DATASET_TRAIN_TYPES[$i]}:${output_dir}\"")
 done
 
+FILTER_ARG=""
+if [[ -n "${FILTER_Q}" ]]; then
+  FILTER_ARG="--extraction-function-arg Q=${FILTER_Q}"
+fi
+
 CACHE_ARG=""
 if [[ -n "${TRACE_CACHE_DIR}" ]]; then
   mkdir -p "${TRACE_CACHE_DIR}"
@@ -74,7 +80,7 @@ for rolling_window in "${ROLLING_WINDOWS[@]}"; do
       fi
 
       log_path="${OUTPUT_BASE_DIR}/create_colocation_${duration}s_window${rolling_window}_${sampling_rate}Hz.log"
-      echo "create-colocation-datasets --dataset-path \"${TRAINTRACK_PATH}\" --output-path \"${OUTPUT_BASE_DIR}\" --duration \"${duration}\" --sampling-rate \"${sampling_rate}\" --rolling-window \"${rolling_window}\" ${start_args[*]} ${SPEC_ARGS[*]} --normalize trace ${CACHE_ARG} >> \"${log_path}\" 2>&1" >> "${COMMANDS_FILE}"
+      echo "create-colocation-datasets --dataset-path \"${TRAINTRACK_PATH}\" --output-path \"${OUTPUT_BASE_DIR}\" --duration \"${duration}\" --sampling-rate \"${sampling_rate}\" --rolling-window \"${rolling_window}\" ${start_args[*]} ${SPEC_ARGS[*]} ${FILTER_ARG} --normalize trace ${CACHE_ARG} >> \"${log_path}\" 2>&1" >> "${COMMANDS_FILE}"
     done
   done
 done
@@ -93,7 +99,7 @@ if [[ -n "${TRACE_CACHE_DIR}" ]]; then
   apptainer exec --bind "${REPO_ROOT}:${REPO_ROOT}" --pwd "${REPO_ROOT}" "${PYTHON_SIF}" \
     create-colocation-datasets --dataset-path "${TRAINTRACK_PATH}" --output-path "${OUTPUT_BASE_DIR}" \
     --duration 5 --sampling-rate 20 --rolling-window 1 --trainride-start-seconds 0 \
-    --trace-cache-dir "${TRACE_CACHE_DIR}" --warm-trace-cache-only
+    ${FILTER_ARG} --trace-cache-dir "${TRACE_CACHE_DIR}" --warm-trace-cache-only
 fi
 
 mem_gib=$(( $(sed -n 's/^MemTotal:[[:space:]]*\([0-9]*\).*/\1/p' /proc/meminfo) / 1024 / 1024 ))

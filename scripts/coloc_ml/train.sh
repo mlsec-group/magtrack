@@ -30,7 +30,7 @@ PYTHON_SIF="${PYTHON_SIF:-./python.sif}"
 COLOC_RESULTS_DIR="${COLOC_RESULTS_DIR:-${REPO_ROOT}/results}"
 COLOC_DATA_DIR="${COLOC_DATA_DIR:-./datasets/coloc_datasets/normalized_trace_all_trains/}"
 
-HPARAMS_OUTPUT="${COLOC_RESULTS_DIR}/model_hparams.yaml"
+HPARAMS_OUTPUT="${REPO_ROOT}/coloc_model/model_hparams.yaml"
 
 CHECKPOINT_DIR="${COLOC_RESULTS_DIR}/coloc_ml/checkpoints"
 MODEL_OUTPUT="${REPO_ROOT}/coloc_model/colocation_net.pth"
@@ -38,8 +38,17 @@ HPARAMS_PATH="${REPO_ROOT}/coloc_model/model_hparams.yaml"
 
 DATA_DIR="${COLOC_DATA_DIR}"
 
+# ── Helper: parse a simple YAML key from a flat YAML file ─────────────────────
+yaml_get() {
+  local file="$1" key="$2"
+  grep -E "^${key}:" "$file" | head -1 | sed "s/^${key}:[[:space:]]*//" | tr -d '"' | tr -d "'"
+}
+
 # ── Training settings ─────────────────────────────────────────────────────────
 TRAIN_EPOCHS="${COLOC_TRAIN_EPOCHS:-1000}"
+TRAIN_BATCH_SIZE="${COLOC_BATCH_SIZE:-$(yaml_get "${HPARAMS_PATH}" batch_size)}"
+TRAIN_LEARNING_RATE="${COLOC_LEARNING_RATE:-$(yaml_get "${HPARAMS_PATH}" lr)}"
+TRAIN_WEIGHT_DECAY="${COLOC_WEIGHT_DECAY:-$(yaml_get "${HPARAMS_PATH}" weight_decay)}"
 TEST_FRACTION="${COLOC_TEST_FRACTION:-0.3}"
 SEED="${COLOC_SEED:-"magtrack"}"
 DATASET_PATH="${COLOC_DATASET_PATH:-from_config}"
@@ -99,9 +108,6 @@ echo " Epochs:      ${TRAIN_EPOCHS}"
 echo " Batch size, learning rate, weight decay and the dataset come from"
 echo " ${HPARAMS_PATH} (the hyperparameter search result)."
 echo ""
-
-# Copy hparams to coloc_model for the training script to find
-cp "${HPARAMS_OUTPUT}" "${HPARAMS_PATH}"
 
 apptainer exec "${GPU_ARGS[@]}" --bind "${REPO_ROOT}:${REPO_ROOT}" --bind "${DATA_DIR}:/data/" "${PYTHON_SIF}" \
   train-ml-model \

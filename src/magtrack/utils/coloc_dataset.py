@@ -119,23 +119,43 @@ class ColocSequentialEvalDataset(Dataset):
 
         self.ids = pd.factorize(df[id_col], sort=False)[0].astype(np.int64)
 
+        grouped: dict[int, list[int]] = {}
+        for idx, cid in enumerate(self.ids):
+            grouped.setdefault(int(cid), []).append(idx)
+        positives = [pair for members in grouped.values() if len(members) > 1
+                     for pair in combinations(members, 2)]
+        self.positive_pairs = (np.asarray(sorted(positives), dtype=np.int64)
+                               if positives else np.empty((0, 2), dtype=np.int64))
+        self.num_positives = len(self.positive_pairs)
+        self.num_negatives = self.n * (self.n - 1) // 2 - self.num_positives
+
+    def _build_all_pairs(self) -> None:
+        """Materialize the full (i, j) table and its labels, as before."""
         # Vectorized: all (i, j) pairs with i <= j (combinations_with_replacement).
         i_idx, j_idx = np.triu_indices(self.n, k=1)
-        self.pairs = np.stack([i_idx, j_idx], axis=1).astype(np.int64)
+        self._pairs = np.stack([i_idx, j_idx], axis=1).astype(np.int64)
 
         #  Vectorized labels: 0 if same id (positive), 1 if different (negative).
-        self.labels = (self.ids[i_idx] != self.ids[j_idx]).astype(np.int8)
+        self._labels = (self.ids[i_idx] != self.ids[j_idx]).astype(np.int8)
 
-        positive_mask = (self.labels == 0)
-        self.positive_pairs = self.pairs[positive_mask]
-        self.num_positives = len(self.positive_pairs)
+    @property
+    def pairs(self) -> np.ndarray:
+        if not hasattr(self, "_pairs"):
+            self._build_all_pairs()
+        return self._pairs
 
-        negative_mask = (self.labels == 1)
-        self.negative_pairs = self.pairs[negative_mask]
-        self.num_negatives = len(self.negative_pairs)
+    @property
+    def labels(self) -> np.ndarray:
+        if not hasattr(self, "_labels"):
+            self._build_all_pairs()
+        return self._labels
+
+    @property
+    def negative_pairs(self) -> np.ndarray:
+        return self.pairs[self.labels == 1]
 
     def __len__(self):
-        return len(self.pairs)
+        return self.n * (self.n - 1) // 2
 
     def __getitem__(self, idx):
         i, j = self.pairs[idx]

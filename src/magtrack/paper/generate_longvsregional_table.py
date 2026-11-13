@@ -3,10 +3,24 @@ import re
 
 import pandas as pd
 
+# 'First (s)' rows of the table and their spelling in the LaTeX command names.
+DURATION_WORDS = {60: 'Sixty', 300: 'ThreeHundred', 600: 'SixHundred', 900: 'NineHundred'}
+
+# LaTeX command prefix of the ML rows per train type. `generate-latex-vars ml-results` defines the commands.
+ML_MACROS = {
+    'All': r'\MlResultBestMCCFirst',
+    'Long distance': r'\MlResultLongDistanceBestMCCFirst',
+    'Regional': r'\MlResultRegionalBestMCCFirst',
+}
+
 
 def load_mcc_data(directory, name):
     """Load MCC scores, calculate overall stats, and group them by 'first' duration."""
-    csv_path = os.path.join(directory, "evaluation_results.results_ml.csv")
+    return load_mcc_csv(os.path.join(directory, "evaluation_results.results_ml.csv"), name)
+
+
+def load_mcc_csv(csv_path, name):
+    """Same as `load_mcc_data`, for an explicit results CSV."""
     if not os.path.exists(csv_path):
         print(f"Warning: {csv_path} not found")
         return None, {}
@@ -116,7 +130,6 @@ def main():
     ]
 
     # 1. Generate Distance-based rows
-    words = {60: 'Sixty', 300: 'ThreeHundred', 600: 'SixHundred', 900: 'NineHundred'}
     dist_macros = {
         'All': r'\ColocDistanceDTWROneBestMCCFirst',
         'Long distance': r'\ColocDistanceLongDistanceDTWROneBestMCCFirst',
@@ -133,12 +146,12 @@ def main():
             if mode_name == 'Regional' and d in [600, 900]:
                 row_str += "& - "
             else:
-                row_str += f"& {dist_macros[mode_name]}{words[d]} "
+                row_str += f"& {dist_macros[mode_name]}{DURATION_WORDS[d]} "
 
         row_str += r"\\"
         dist_rows.append(row_str)
 
-    # 2. Generate ML-based rows dynamically
+    # 2. Generate ML-based rows: commands from vars/coloc_ml.tex, like the distance-based rows
     ml_rows = []
     for i, d in enumerate(durations):
         prefix = r"\textbf{Machine Learning}" if i == 0 else ""
@@ -151,14 +164,13 @@ def main():
 
         for mode_name, data in modes:
             if data and d in data:
-                mean = data[d]['mean']
-                std = data[d]['std']
+                macro = f"{ML_MACROS[mode_name]}{DURATION_WORDS[d]}"
 
                 # Highlight bold if it's the best performing train type for this duration
-                if abs(mean - best_mean) < 1e-5:
-                    row_str += f"& \\textbf{{{mean:.2f}}} $\\pm$ \\textbf{{{std:.2f}}} "
+                if abs(data[d]['mean'] - best_mean) < 1e-5:
+                    row_str += f"& \\textbf{{{macro}}} "
                 else:
-                    row_str += f"& {mean:.2f} $\\pm$ {std:.2f} "
+                    row_str += f"& {macro} "
             else:
                 row_str += "& - "
 

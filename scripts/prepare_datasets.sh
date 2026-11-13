@@ -68,6 +68,12 @@ done
 
 trap - ERR
 
+# One checksum file per dataset type, verifiable with: sha256sum -c results/datasets/<type>.sha256
+mkdir -p results/datasets
+for type in tmd_datasets coloc_datasets coloc_baseline; do
+  find "datasets/${type}" -name '*.pkl' -type f | sort | xargs -r sha256sum > "results/datasets/${type}.sha256"
+done
+
 echo
 echo "=============================================================================="
 echo " All ${total} steps done in $(fmt_duration $(( $(date +%s) - started )))"
@@ -76,3 +82,4 @@ echo "   datasets/tmd_datasets      transport mode detection datasets"
 echo "   datasets/coloc_datasets    colocation datasets (filtered trace)"
 echo "   datasets/coloc_baseline    colocation baseline (absolute field)"
 echo "   results/paper/vars         dataset LaTeX variables"
+echo "   results/datasets           dataset checksums (sha256)"

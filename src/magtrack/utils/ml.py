@@ -3,6 +3,7 @@ from __future__ import annotations
 from time import perf_counter
 
 import numpy as np
+import pandas as pd
 import torch
 from sklearn.metrics import (
     accuracy_score,
@@ -69,36 +70,141 @@ def build_eval_pairs(
     return pairs, labels
 
 
+class RecordingWindowSampler:
+    """Training pairs of random time-aligned windows cut from whole recordings.
+
+    A recording is all chunks of one device in one segment ((segment_id, source_file)), stitched in
+    chunk order. A pair is two recordings plus one offset; both windows are cut at the same offset,
+    so they cover the same time span. Positive = two recordings of the same segment_id (every such
+    pair equally likely), negative = recordings of different segments. Offsets are not tied to chunk
+    boundaries, and windows are one chunk long and only cover chunks present in both recordings.
+
+    A negative reuses a recording and the offset of a positive sample and only replaces the other
+    recording by one from another segment, so negatives have the same distribution of ride positions
+    as positives (no "where in the ride is this window" shortcut).
+
+    `signals` holds the chunks in the row order of `df.reset_index()`.
+    """
+
+    def __init__(self, signals: torch.Tensor, df: pd.DataFrame):
+        df = df.reset_index(drop=True)
+        device = signals.device
+        chunk_len = signals.shape[1]
+        chunk_idx = torch.tensor(df["id"].str.rsplit("_", n=1).str[-1].astype(int).to_numpy(), device=device)
+        rec_codes_np, rec_keys = pd.factorize(df["segment_id"].astype(str) + "::" + df["source_file"].astype(str))
+        rec_codes = torch.tensor(rec_codes_np, device=device)
+        n_rec, n_chunks = len(rec_keys), int(chunk_idx.max()) + 1
+
+        self.chunk_len = chunk_len
+        self.recordings = torch.zeros(n_rec, n_chunks, chunk_len, device=device, dtype=signals.dtype)
+        self.recordings[rec_codes, chunk_idx] = signals
+        self.recordings = self.recordings.view(n_rec, n_chunks * chunk_len)
+        self.chunk_valid = torch.zeros(n_rec, n_chunks, device=device, dtype=torch.bool)
+        self.chunk_valid[rec_codes, chunk_idx] = True
+        self.n_chunks = torch.zeros(n_rec, device=device, dtype=torch.long).scatter_reduce(
+            0, rec_codes, chunk_idx + 1, reduce="amax")
+
+        segment_codes = torch.tensor(
+            pd.factorize(df.groupby(rec_codes_np)["segment_id"].first())[0], device=device)
+        self.segment = segment_codes
+        same = (segment_codes.unsqueeze(0) == segment_codes.unsqueeze(1)).triu(diagonal=1)
+        self.pos_pairs = torch.nonzero(same)  # (P, 2) recording pairs of the same segment
+        if self.pos_pairs.shape[0] == 0:
+            raise ValueError("No segment has more than one recording; cannot build positive pairs.")
+        self.pos_weights = torch.ones(self.pos_pairs.shape[0], device=device)
+
+    def _offsets(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """Random offsets inside the common length, resampled until all covered chunks exist in both."""
+        span = torch.minimum(self.n_chunks[a], self.n_chunks[b]) * self.chunk_len - self.chunk_len + 1
+        offsets = torch.zeros_like(a)
+        todo = torch.ones_like(a, dtype=torch.bool)
+        for _ in range(16):
+            cand = (torch.rand(a.shape[0], device=a.device) * span).long()
+            first, last = cand // self.chunk_len, (cand + self.chunk_len - 1) // self.chunk_len
+            ok = (self.chunk_valid[a, first] & self.chunk_valid[a, last]
+                  & self.chunk_valid[b, first] & self.chunk_valid[b, last])
+            take = todo & ok
+            offsets[take] = cand[take]
+            todo &= ~ok
+            if not bool(todo.any()):
+                break
+        return offsets  # leftovers keep offset 0: chunk 0 exists in every recording
+
+    def sample_positives(self, n: int):
+        sel = self.pos_pairs[torch.multinomial(self.pos_weights, n, replacement=True)]
+        a, b = sel[:, 0], sel[:, 1]
+        return a, b, self._offsets(a, b)
+
+    def _covers(self, rec: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+        """Whether recording `rec` has data for the whole window starting at `offsets`."""
+        first, last = offsets // self.chunk_len, (offsets + self.chunk_len - 1) // self.chunk_len
+        n_chunks = self.chunk_valid.shape[1]
+        inside = last < n_chunks
+        last = last.clamp(max=n_chunks - 1)
+        return inside & self.chunk_valid[rec, first] & self.chunk_valid[rec, last]
+
+    def sample_negatives(self, n: int):
+        n_rec = self.segment.shape[0]
+        device = self.segment.device
+        # Recording a and the offset follow the positive distribution (either side of a positive pair);
+        # b is any recording of another segment that has data for the same window.
+        pa, pb, offsets = self.sample_positives(n)
+        a = torch.where(torch.rand(n, device=device) < 0.5, pa, pb)
+        b = torch.randint(0, n_rec, (n,), device=device)
+        bad = (self.segment[a] == self.segment[b]) | ~self._covers(b, offsets)
+        for _ in range(64):
+            if not bool(bad.any()):
+                break
+            b = b.masked_scatter(bad, torch.randint(0, n_rec, (int(bad.sum()),), device=device))
+            bad = (self.segment[a] == self.segment[b]) | ~self._covers(b, offsets)
+        if bool(bad.any()):
+            # Rare leftovers (no long-enough recording found): fall back to an offset inside the common length.
+            b = b.masked_scatter(bad, torch.randint(0, n_rec, (int(bad.sum()),), device=device))
+            still = self.segment[a] == self.segment[b]
+            for _ in range(32):
+                if not bool((bad & still).any()):
+                    break
+                b = b.masked_scatter(bad & still, torch.randint(0, n_rec, (int((bad & still).sum()),), device=device))
+                still = self.segment[a] == self.segment[b]
+            offsets = torch.where(bad, self._offsets(a, b), offsets)
+        return a, b, offsets
+
+    def windows(self, a: torch.Tensor, b: torch.Tensor, offsets: torch.Tensor):
+        idx = offsets.unsqueeze(1) + torch.arange(self.chunk_len, device=offsets.device).unsqueeze(0)
+        return self.recordings[a.unsqueeze(1), idx], self.recordings[b.unsqueeze(1), idx]
+
+
 def train_one_epoch_gpu(
         model,
-        signals: torch.Tensor,
-        ids: torch.Tensor,
-        positive_pairs: torch.Tensor,
+        sampler: RecordingWindowSampler,
+        num_pos: int,
         batch_size: int,
         criterion,
         optimizer,
         scheduler,
         device,
         smoothing: float = 0.1,
-        noise_std: float = 1e-1,
 ) -> float:
-    """One training epoch using GPU-resident signals and pair indices.
+    """One training epoch over `num_pos` positive and `num_pos` negative window pairs from `sampler`.
 
-    Negatives are sampled once per epoch on `device`; batches are formed by
-    index-permuting the (positives | negatives) pair table. Returns mean loss.
+    Pairs are sampled once per epoch on `device` and the order within each pair is swapped with
+    probability 0.5; batches are formed by index-permuting the (positives | negatives) pair table.
+    Returns mean loss.
     """
     model.train()
-    n = signals.shape[0]
-    num_pos = positive_pairs.shape[0]
     total = num_pos * 2  # 1:1 negative ratio
 
-    neg_i, neg_j = sample_negatives_gpu(n, num_pos, ids)
-    epoch_i = torch.cat([positive_pairs[:, 0], neg_i])
-    epoch_j = torch.cat([positive_pairs[:, 1], neg_j])
+    pos_i, pos_j, pos_off = sampler.sample_positives(num_pos)
+    neg_i, neg_j, neg_off = sampler.sample_negatives(num_pos)
+    epoch_i = torch.cat([pos_i, neg_i])
+    epoch_j = torch.cat([pos_j, neg_j])
+    epoch_off = torch.cat([pos_off, neg_off])
     epoch_labels = torch.cat([
         torch.zeros(num_pos, dtype=torch.long, device=device),
         torch.ones(num_pos, dtype=torch.long, device=device),
     ])
+    swap = torch.rand(total, device=device) < 0.5
+    epoch_i, epoch_j = torch.where(swap, epoch_j, epoch_i), torch.where(swap, epoch_i, epoch_j)
     perm = torch.randperm(total, device=device)
 
     total_loss = torch.zeros((), device=device)
@@ -106,13 +212,8 @@ def train_one_epoch_gpu(
 
     for start in range(0, total, batch_size):
         sel = perm[start:start + batch_size]
-        x1 = signals[epoch_i[sel]]
-        x2 = signals[epoch_j[sel]]
+        x1, x2 = sampler.windows(epoch_i[sel], epoch_j[sel], epoch_off[sel])
         label = epoch_labels[sel]
-
-        if noise_std > 0:
-            x1 = x1 + torch.normal(0., noise_std, size=x1.shape, device=device)
-            x2 = x2 + torch.normal(0., noise_std, size=x2.shape, device=device)
 
         label_float = label.float().unsqueeze(1)
         label_float = label_float * (1.0 - smoothing) + (0.5 * smoothing)

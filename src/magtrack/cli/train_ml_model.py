@@ -17,12 +17,12 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from magtrack.utils.coloc_dataset import ColocSequentialEvalDataset
-from magtrack.utils.evaluation import train_test_split
+from magtrack.utils.evaluation import consistent_train_test_split
 from magtrack.utils.loader import read_pickle, get_metadata_from_dataset
 from magtrack.utils.ml import (
+    RecordingWindowSampler,
     build_eval_pairs,
     evaluate,
-    sample_negatives_gpu,
 )
 from magtrack.utils.model import ColocationCNN
 from magtrack.utils.utils import resolve_seed
@@ -86,7 +86,7 @@ def _build_model_from_hparams(hparams_path: Path) -> tuple[ColocationCNN, dict]:
     with open(hparams_path, encoding="utf-8") as fh:
         h = yaml.safe_load(fh) or {}
 
-    target_len = 30 * 10
+    target_len = int(h.get("chunk_size_seconds", 20) * h.get("hz", 40))
     conv_channels, kernel_sizes, strides, paddings, pool_kernel_sizes, pool_strides = _resolve_conv_hparams(h)
 
     model = ColocationCNN(
@@ -191,7 +191,7 @@ def _get_gpu_split_from_dfs(train_df, test_df, device: str, seed_int: int, prelo
 def train(
         model,
         train_signals,
-        train_ids,
+        train_df,
         train_pos_pairs,
         test_signals,
         test_pairs,
@@ -226,7 +226,7 @@ def train(
     global_step = 0
     smoothing = 0.1
 
-    n_train = train_signals.shape[0]
+    sampler = RecordingWindowSampler(train_signals, train_df)
     num_pos = train_pos_pairs.shape[0]
     total_pairs = num_pos * 2  # neg_pos_ratio = 1
     last_metrics = None
@@ -235,11 +235,15 @@ def train(
         total_loss = torch.zeros((), device=device)
         n_batches = 0
 
-        # Resample negatives once per epoch on the GPU.
-        neg_i, neg_j = sample_negatives_gpu(n_train, num_pos, train_ids)
+        # Resample positives and negatives once per epoch on the GPU.
+        pos_i, pos_j, pos_off = sampler.sample_positives(num_pos)
+        neg_i, neg_j, neg_off = sampler.sample_negatives(num_pos)
         # Build full pair table for this epoch: (positives | negatives), (2*P, 2)
-        epoch_i = torch.cat([train_pos_pairs[:, 0], neg_i])
-        epoch_j = torch.cat([train_pos_pairs[:, 1], neg_j])
+        epoch_i = torch.cat([pos_i, neg_i])
+        epoch_j = torch.cat([pos_j, neg_j])
+        epoch_off = torch.cat([pos_off, neg_off])
+        swap = torch.rand(total_pairs, device=device) < 0.5
+        epoch_i, epoch_j = torch.where(swap, epoch_j, epoch_i), torch.where(swap, epoch_i, epoch_j)
         epoch_labels = torch.cat([
             torch.zeros(num_pos, dtype=torch.long, device=device),
             torch.ones(num_pos, dtype=torch.long, device=device),
@@ -253,11 +257,7 @@ def train(
             label = epoch_labels[sel]
 
             optimizer.zero_grad(set_to_none=True)
-            x1 = train_signals[i_idx]
-            x2 = train_signals[j_idx]
-
-            x1 = x1 + torch.normal(mean=0., std=1e-1, size=x1.shape, device=device)
-            x2 = x2 + torch.normal(mean=0., std=1e-1, size=x2.shape, device=device)
+            x1, x2 = sampler.windows(i_idx, j_idx, epoch_off[sel])
 
             label_float = label.float().unsqueeze(1)
             label_float = label_float * (1.0 - smoothing) + (0.5 * smoothing)
@@ -436,7 +436,7 @@ def train_ml(
     logger.info("Loaded {} samples, {} classes.", len(data), n_classes)
     logger.info("Using chunk_size_seconds={}s", chunk_size_seconds)
 
-    train_df, test_df = train_test_split(
+    train_df, test_df = consistent_train_test_split(
         data,
         test_frac=test_fraction,
         random_state=seed_int,
@@ -491,7 +491,7 @@ def train_ml(
     _, _, trained_model_state = train(
         model,
         train_signals,
-        train_ids,
+        train_df,
         train_pos_pairs,
         test_signals,
         test_pairs,

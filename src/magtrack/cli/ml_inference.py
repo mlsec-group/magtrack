@@ -12,7 +12,7 @@ import torch
 
 from magtrack.cli.train_ml_model import _build_model_from_hparams
 from magtrack.utils.coloc_dataset import ColocSequentialEvalDataset
-from magtrack.utils.evaluation import train_test_split
+from magtrack.utils.evaluation import consistent_train_test_split
 from magtrack.utils.loader import read_pickle, get_metadata_from_dataset
 from magtrack.utils.ml import (
     build_eval_pairs,
@@ -95,7 +95,7 @@ def main():
     codes, uniques = pd.factorize(data["id"])
     data["class"] = codes
 
-    train_df, test_df = train_test_split(
+    train_df, test_df = consistent_train_test_split(
         data,
         test_frac=test_fraction,
         random_state=seed_int,

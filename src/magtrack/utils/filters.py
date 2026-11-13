@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from scipy.signal import iirnotch, filtfilt, butter
+from scipy.signal import iirpeak, filtfilt, butter
 
 
 def _get_sampling_rate(timestamps) -> float:
@@ -161,18 +161,18 @@ def filter_abs(
 def filter_notch_highpass(
         data: pd.DataFrame,
         notch_freq: float = 16.7,
-        Q: int = 1,
+        Q: int = 10,
         highpass_cutoff: float = 0.1,
         timestamp_column: str = "timestamp",
         **kwargs,
 ) -> pd.DataFrame:
     """
-    Remove DC/static field, notch out 16.7 Hz interference, and normalize.
+    Remove DC/static field and isolate the 16.7 Hz railway traction-current component.
 
     Args:
         data: pandas.DataFrame with columns ['timestamp', 'x', 'y', 'z'].
-        notch_freq: Frequency to notch out (default 16.7 Hz).
-        Q: Quality factor for notch filter.
+        notch_freq: Centre frequency to extract (default 16.7 Hz).
+        Q: Quality factor of the peak filter.
         highpass_cutoff: Cutoff frequency for high-pass filter (Hz).
         timestamp_column: name of the timestamp column in *data* (default ``"timestamp"``).
 
@@ -187,8 +187,8 @@ def filter_notch_highpass(
 
     def process_axis(x: np.ndarray) -> np.ndarray:
         x_hp = filtfilt(hp_b, hp_a, x)
-        b_notch, a_notch = iirnotch(notch_freq, Q, fs)
-        return filtfilt(b_notch, a_notch, x_hp)
+        b_peak, a_peak = iirpeak(notch_freq, Q, fs)
+        return filtfilt(b_peak, a_peak, x_hp)
 
     x_filt = process_axis(data["x"].values)
     y_filt = process_axis(data["y"].values)
@@ -197,3 +197,4 @@ def filter_notch_highpass(
     mag = np.sqrt(x_filt ** 2 + y_filt ** 2 + z_filt ** 2)
 
     return pd.DataFrame({"timestamp": data[timestamp_column], "magnitude": mag})
+
