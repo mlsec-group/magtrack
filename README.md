@@ -10,7 +10,7 @@ This is the artifact repository for the publication:
 | --- |-------------------------------------------|
 | Paper | <https://www.mlsec.tu-berlin.de/docs/2026b-ccs.pdf> |
 | Code (this repository) | <https://github.com/mlsec-group/magtrack> |
-| Code, archived snapshot | <https://doi.org/10.5281/zenodo.22662413> |
+| Code, archived snapshot | <https://doi.org/10.5281/zenodo.24201651> |
 | TrainTrack dataset | <https://doi.org/10.5281/zenodo.22206115> |
 | License | CC BY-SA 4.0 (paper, code and data)       |
 
