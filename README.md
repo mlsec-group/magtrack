@@ -70,12 +70,12 @@ The experiments below reproduce them.
 | C1 | TMD, single chunk | MCC 0.83, F1 0.94                 | Table 4 |
 | C1 | TMD, with majority vote | MCC 0.93, F1 0.98                 | Table 4 |
 | C2 | Colocation, baseline (DDTW on absolute field) | MCC 0.09                          | Table 8 |
-| C3 | Colocation, distance-based (DTW on 16.7 Hz trace) | MCC 0.50                          | Tables 6 and 8 |
-| C4 | Colocation, learning-based (CNN) | MCC 0.79, F1 0.89                 | Figures 6–7, Table 8 |
-| C4 | CNN is ~16× faster than DTW | < 1 ms vs. up to ~600 ms per pair | Figure 8 |
+| C3 | Colocation, distance-based (DTW on 16.7 Hz trace) | MCC 0.60                          | Tables 6 and 8 |
+| C4 | Colocation, learning-based (CNN) | MCC 0.79, F1 0.90                 | Figures 6–7, Table 8 |
+| C4 | CNN is up to 22× faster than DTW | 24 ms vs. 527 ms per pair (900 s, 60 Hz) | Figure 8 |
 
-Both attacks work best on the **first 300 s** of a ride.
-Five minutes of travel already carry enough structure.
+Transport mode detection works best on the **first 300 s** of a ride: five minutes of travel already carry enough structure.
+Colocation inference keeps improving with longer recordings and works best on the **first 900 s**.
 
 ### The dataset
 
@@ -331,7 +331,7 @@ scripts/coloc_distance/paper.sh
 `results/paper/vars/coloc_distances_dtw_r1.tex`.
 
 **Expect:**
-a best MCC of **0.50 ± 0.04**, at 300 s of recording and 60 data points per second.
+a best MCC of **0.60 ± 0.11**, at 900 s of recording and 60 data points per second.
 
 Both E2 and E3 share these variables:
 
@@ -377,13 +377,13 @@ If you do run the search and the training, they overwrite those two files.
 under `long_distance/` and `regional/`, plus `results/coloc_ml/majority_vote/master_metrics_by_k.csv`.
 `paper.sh` writes
 `results/paper/figures/mcc_paper_single_evaluation_results.results_ml.pdf` (MCC heatmaps, Figure 6),
-`results/paper/figures/mcc_chunk60s_win1_10Hz.pdf` (majority vote, Figure 7),
+`results/paper/figures/mcc_chunk60s_win5_60Hz.pdf` (majority vote, Figure 7),
 `results/paper/tables/mcc_train_types.tex` (Table 7),
 `results/paper/tables/hparam_search_table.tex` (Table 9, only if `results/coloc_ml/hyperparam_search.db` exists) and
 `results/paper/vars/coloc_ml.tex`.
 
-**Expect:** a best MCC of **0.79** and F1 of **0.89**, at 300 s of recording,
-60 s chunks and a rolling window of 1.
+**Expect:** a best MCC of **0.79** and F1 of **0.90**, at 900 s of recording,
+60 s chunks, 60 data points per second and a rolling window of 5.
 
 All three scripts detect a CUDA GPU and fall back to the CPU if there is none.
 Training progress can be watched with `tensorboard --logdir runs/`, checkpoints
